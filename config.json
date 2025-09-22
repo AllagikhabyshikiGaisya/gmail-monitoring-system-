@@ -1,0 +1,18 @@
+{
+  "credentials_path": "credentials.json",
+  "token_path": "token.json",
+  "webhook_url": "https://y8xp2r4oy7i.jp.larksuite.com/base/automation/webhook/event/DuuGaDaKVw5FCFhFKogjybwepic",
+  "check_interval": 20,
+  "max_emails": 30,
+  "log_level": "INFO",
+  "filter_keywords": [
+    "lark",
+    "larksuite",
+    "イベント",
+    "申込",
+    "問い合わせ"
+  ],
+  "auto_start": false,
+  "webhook_timeout": 30,
+  "max_retries": 3
+}
