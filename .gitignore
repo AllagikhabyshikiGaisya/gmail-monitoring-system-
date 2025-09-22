@@ -1,0 +1,18 @@
+# Credentials and tokens
+credentials.json
+token.json
+
+# Cache files
+__pycache__/
+*.pyc
+
+# Log files
+*.log
+
+# Generated data files
+processed_data_*.json
+processed_emails.json
+processor_stats.json
+
+# Config files with sensitive data
+config.json
