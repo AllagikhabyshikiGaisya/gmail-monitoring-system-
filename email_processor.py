@@ -7,6 +7,7 @@ import requests
 import base64
 import time
 import logging
+import sqlite3
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
 from email.mime.text import MIMEText
@@ -20,8 +21,16 @@ from googleapiclient.errors import HttpError
 import html
 import unicodedata
 import threading
+from pathlib import Path
 
-# Configure logging
+# Load environment variables from .env file if available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv is optional
+
+# Configure logging with better formatting
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -31,6 +40,200 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+class EmailDatabase:
+    """SQLite database manager for tracking processed emails"""
+    
+    def __init__(self, db_path: str = "processed_emails.db"):
+        self.db_path = db_path
+        self.init_database()
+        
+    def init_database(self):
+        """Initialize the SQLite database with required tables"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Create processed emails table
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS processed_emails (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        email_id TEXT UNIQUE NOT NULL,
+                        thread_id TEXT,
+                        subject TEXT,
+                        sender TEXT,
+                        received_date TEXT,
+                        processed_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                        webhook_sent BOOLEAN DEFAULT FALSE,
+                        archived BOOLEAN DEFAULT FALSE,
+                        json_data TEXT
+                    )
+                ''')
+                
+                # Create processing stats table
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS processing_stats (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        date TEXT NOT NULL,
+                        emails_processed INTEGER DEFAULT 0,
+                        webhooks_successful INTEGER DEFAULT 0,
+                        webhooks_failed INTEGER DEFAULT 0,
+                        UNIQUE(date)
+                    )
+                ''')
+                
+                conn.commit()
+                logger.info(f"Database initialized: {self.db_path}")
+                
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}")
+            raise
+    
+    def is_email_processed(self, email_id: str) -> bool:
+        """Check if an email has already been processed"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1 FROM processed_emails WHERE email_id = ?", (email_id,))
+                return cursor.fetchone() is not None
+        except Exception as e:
+            logger.error(f"Error checking if email is processed: {e}")
+            return False
+    
+    def mark_email_processed(self, email_data: Dict, json_data: Dict = None, webhook_sent: bool = False):
+        """Mark an email as processed in the database"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT OR REPLACE INTO processed_emails 
+                    (email_id, thread_id, subject, sender, received_date, webhook_sent, json_data)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    email_data.get('id'),
+                    email_data.get('thread_id'),
+                    email_data.get('subject', ''),
+                    email_data.get('sender', ''),
+                    email_data.get('formatted_date', ''),
+                    webhook_sent,
+                    json.dumps(json_data) if json_data else None
+                ))
+                conn.commit()
+                logger.info(f"Marked email {email_data.get('id', 'unknown')} as processed")
+        except Exception as e:
+            logger.error(f"Error marking email as processed: {e}")
+    
+    def get_processed_count(self) -> int:
+        """Get total number of processed emails"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM processed_emails")
+                return cursor.fetchone()[0]
+        except Exception as e:
+            logger.error(f"Error getting processed count: {e}")
+            return 0
+    
+    def get_recent_processed_emails(self, limit: int = 20) -> List[Dict]:
+        """Get recently processed emails"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT email_id, subject, sender, received_date, processed_date, webhook_sent
+                    FROM processed_emails 
+                    ORDER BY processed_date DESC 
+                    LIMIT ?
+                ''', (limit,))
+                
+                emails = []
+                for row in cursor.fetchall():
+                    emails.append({
+                        'email_id': row[0],
+                        'subject': row[1],
+                        'sender': row[2],
+                        'received_date': row[3],
+                        'processed_date': row[4],
+                        'webhook_sent': row[5]
+                    })
+                return emails
+        except Exception as e:
+            logger.error(f"Error getting recent emails: {e}")
+            return []
+    
+    def update_daily_stats(self, processed: int, successful: int, failed: int):
+        """Update daily processing statistics"""
+        try:
+            today = datetime.now().strftime('%Y-%m-%d')
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT OR REPLACE INTO processing_stats 
+                    (date, emails_processed, webhooks_successful, webhooks_failed)
+                    VALUES (?, 
+                        COALESCE((SELECT emails_processed FROM processing_stats WHERE date = ?), 0) + ?,
+                        COALESCE((SELECT webhooks_successful FROM processing_stats WHERE date = ?), 0) + ?,
+                        COALESCE((SELECT webhooks_failed FROM processing_stats WHERE date = ?), 0) + ?
+                    )
+                ''', (today, today, processed, today, successful, today, failed))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error updating daily stats: {e}")
+    
+    def get_stats(self) -> Dict:
+        """Get processing statistics"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Total processed
+                cursor.execute("SELECT COUNT(*) FROM processed_emails")
+                total_processed = cursor.fetchone()[0]
+                
+                # Successful webhooks
+                cursor.execute("SELECT COUNT(*) FROM processed_emails WHERE webhook_sent = TRUE")
+                successful_webhooks = cursor.fetchone()[0]
+                
+                # Failed webhooks
+                cursor.execute("SELECT COUNT(*) FROM processed_emails WHERE webhook_sent = FALSE")
+                failed_webhooks = cursor.fetchone()[0]
+                
+                # Today's stats
+                today = datetime.now().strftime('%Y-%m-%d')
+                cursor.execute("SELECT * FROM processing_stats WHERE date = ?", (today,))
+                today_stats = cursor.fetchone()
+                
+                return {
+                    'total_processed': total_processed,
+                    'successful_webhooks': successful_webhooks,
+                    'failed_webhooks': failed_webhooks,
+                    'today_processed': today_stats[2] if today_stats else 0,
+                    'today_successful': today_stats[3] if today_stats else 0,
+                    'today_failed': today_stats[4] if today_stats else 0
+                }
+        except Exception as e:
+            logger.error(f"Error getting stats: {e}")
+            return {
+                'total_processed': 0,
+                'successful_webhooks': 0,
+                'failed_webhooks': 0,
+                'today_processed': 0,
+                'today_successful': 0,
+                'today_failed': 0
+            }
+    
+    def clear_all_data(self):
+        """Clear all processed email data - use with caution!"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM processed_emails")
+                cursor.execute("DELETE FROM processing_stats")
+                conn.commit()
+                logger.info("Cleared all processed email data")
+        except Exception as e:
+            logger.error(f"Error clearing data: {e}")
+
 
 class UniversalJSONProcessor:
     """Enhanced processor with better Japanese text handling"""
@@ -187,12 +390,12 @@ class UniversalJSONProcessor:
                 r'お客様?名[：:\s]*([^\n\r]+?)(?:\n|$)',
                 r'申込者?名[：:\s]*([^\n\r]+?)(?:\n|$)',
                 r'ご依頼者[：:\s]*([^\n\r]+?)(?:\n|$)',
-                r'([^\s\n]{2,10})\s*(?:様|さん|氏|殿)(?:\s|$)',  # Name with honorific
+                r'([^\s\n]{2,10})\s*(?:様|さん|氏|殿)(?:\s|$)',
             ],
             'furigana': [
                 r'(?:フリガナ|ふりがな|カナ|Furigana)[：:\s]*([^\n\r]+?)(?:\n|$)',
                 r'(?:よみがな|読み仮名)[：:\s]*([^\n\r]+?)(?:\n|$)',
-                r'([ァ-ヾ\s]{3,20})(?:\s|$)'  # Katakana pattern
+                r'([ァ-ヾ\s]{3,20})(?:\s|$)'
             ],
             'email': [
                 r'(?:メールアドレス|E-?mail|e-?mail)[：:\s]*([^\s\n]+@[^\s\n]+)(?:\s|$)',
@@ -222,7 +425,7 @@ class UniversalJSONProcessor:
                 r'([都道府県市区町村][^\n]+?)(?:\n|$)'
             ],
             
-            # Company Information Patterns (Enhanced)
+            # Company Information Patterns
             'company_name': [
                 r'(?:会社名|企業名|法人名|Company)[：:\s]*([^\n]+?)(?:\n|$)',
                 r'(?:勤務先|お勤め先)[：:\s]*([^\n]+?)(?:\n|$)',
@@ -230,86 +433,27 @@ class UniversalJSONProcessor:
                 r'(株式会社[^\s\n]+)',
                 r'([^\s]+会社)(?:\s|$)'
             ],
-            'branch_name': [
-                r'(?:支店名|店舗名|営業所|Branch)[：:\s]*([^\n]+?)(?:\n|$)',
-                r'([^\s]+(?:支店|店舗|営業所|支社))(?:\s|$)'
-            ],
             
-            # Event Information Patterns (Enhanced)
+            # Event Information Patterns
             'event_name': [
                 r'(?:イベント名|セミナー名|講座名|Event)[：:\s]*([^\n]+?)(?:\n|$)',
                 r'(?:説明会|相談会|見学会)[：:\s]*([^\n]+?)(?:\n|$)',
                 r'([^\n]*(?:セミナー|講座|説明会|相談会|見学会|イベント)[^\n]*)(?:\n|$)'
             ],
-            'event_date': [
-                r'(?:開催日|実施日|日程|Date)[：:\s]*([^\n]+?)(?:\n|$)',
-                r'(\d{4}年\d{1,2}月\d{1,2}日)',
-                r'(\d{4}/\d{1,2}/\d{1,2})',
-                r'(\d{1,2}月\d{1,2}日)',
-                r'([月火水木金土日]曜日)',
-                r'(令和\d+年\d+月\d+日)',
-                r'(平成\d+年\d+月\d+日)'
-            ],
-            'event_time': [
-                r'(?:時間|開催時間|実施時間|Time)[：:\s]*([^\n]+?)(?:\n|$)',
-                r'(\d{1,2}:\d{2}(?:～|〜|-)\d{1,2}:\d{2})',
-                r'(\d{1,2}時\d{2}分?(?:～|〜|-)\d{1,2}時\d{2}分?)',
-                r'(\d{1,2}時(?:～|〜|-)\d{1,2}時)',
-                r'(午前|午後)\d{1,2}時'
-            ],
-            'event_place': [
-                r'(?:会場|場所|開催場所|Venue)[：:\s]*([^\n]+?)(?:\n|$)',
-                r'(?:所在地|住所).*?会場[：:\s]*([^\n]+?)(?:\n|$)',
-                r'([^\n]*(?:ホール|会館|センター|ビル|館)[^\n]*)(?:\n|$)'
-            ],
             
-            # Reservation Information Patterns (Enhanced)
-            'preferred_date': [
-                r'(?:希望日|ご希望日|予約希望日|Preferred Date)[：:\s]*([^\n]+?)(?:\n|$)',
-                r'(?:見学希望日|訪問希望日)[：:\s]*([^\n]+?)(?:\n|$)',
-                r'第\d希望[：:\s]*([^\n]+?)(?:\n|$)'
-            ],
-            'preferred_time': [
-                r'(?:希望時間|ご希望時間|Preferred Time)[：:\s]*([^\n]+?)(?:\n|$)',
-                r'(?:見学希望時間|訪問希望時間)[：:\s]*([^\n]+?)(?:\n|$)',
-                r'都合の良い時間[：:\s]*([^\n]+?)(?:\n|$)'
-            ],
-            
-            # Inquiry Information Patterns (Enhanced)
+            # Inquiry Information Patterns
             'inquiry_text': [
                 r'(?:お問い?合わせ内容|ご質問|相談内容|Inquiry)[：:\s]*([^\n]*?)(?:\n\n|$)',
                 r'(?:メッセージ|内容|詳細)[：:\s]*([^\n]*?)(?:\n\n|$)',
                 r'(?:ご要望|要望|希望)[：:\s]*([^\n]*?)(?:\n\n|$)',
                 r'その他.*?[：:\s]*([^\n]*?)(?:\n\n|$)'
             ],
-            'inquiry_source': [
-                r'(?:きっかけ|お問い?合わせの?きっかけ|Source)[：:\s]*([^\n]+?)(?:\n|$)',
-                r'(?:どちらで|どこで).*?知り.*?[：:\s]*([^\n]+?)(?:\n|$)',
-                r'(?:媒体|メディア)[：:\s]*([^\n]+?)(?:\n|$)'
-            ],
             
-            # Budget Information Patterns (Enhanced)
-            'budget_monthly': [
-                r'(?:希望返済額|月々の返済額|Monthly Payment)[：:\s]*([^\n]+?)(?:\n|$)',
-                r'(?:毎月の支払い|月額)[：:\s]*([^\n]+?)(?:\n|$)',
-                r'(\d+(?:万|萬)円?)(?:\s*/月|\s*毎月)'
-            ],
-            'monthly_rent': [
-                r'(?:月々の家賃|現在の家賃|Monthly Rent)[：:\s]*([^\n]+?)(?:\n|$)',
-                r'(?:家賃|賃料)[：:\s]*([^\n]+?)(?:\n|$)',
-                r'(\d+(?:万|萬)円?)(?:\s*/月|\s*毎月).*?(?:家賃|賃料)'
-            ],
-            
-            # Property Information Patterns (Enhanced)
+            # Property Information Patterns
             'property_name': [
                 r'(?:物件名|建物名|Property)[：:\s]*([^\n]+?)(?:\n|$)',
                 r'(?:マンション名|アパート名)[：:\s]*([^\n]+?)(?:\n|$)',
                 r'([^\n]*(?:マンション|アパート|ハウス|レジデンス|パーク)[^\n]*)(?:\n|$)'
-            ],
-            'property_type': [
-                r'(?:物件種別|建物種別|Property Type)[：:\s]*([^\n]+?)(?:\n|$)',
-                r'((?:分譲|賃貸)?(?:マンション|アパート|一戸建て|戸建|土地))(?:\s|$)',
-                r'(?:種別|タイプ)[：:\s]*([^\n]+?)(?:\n|$)'
             ],
             'price': [
                 r'(?:価格|金額|Price|販売価格)[：:\s]*([^\n]+?)(?:\n|$)',
@@ -318,85 +462,46 @@ class UniversalJSONProcessor:
                 r'(\d+,\d{3}(?:,\d{3})*円?)(?:\s|$)'
             ],
             
-            # URLs (Enhanced)
+            # URLs
             'url': [
                 r'(https?://[^\s\n]+)',
                 r'(?:URL|Link)[：:\s]*(https?://[^\s\n]+)',
                 r'(?:詳細|詳しく).*?(https?://[^\s\n]+)',
                 r'(www\.[^\s\n]+)',
                 r'([a-zA-Z0-9.-]+\.(?:com|co\.jp|jp|net|org)[^\s]*)'
-            ],
-            
-            # Additional Japanese-specific patterns
-            'prefecture': [
-                r'([都道府県])',
-                r'(東京都|大阪府|京都府|北海道|[a-zA-Z]{2,3}県)',
-            ],
-            'city': [
-                r'([市区町村])',
-                r'([^\s]+(?:市|区|町|村))',
-            ],
-            'building_type': [
-                r'((?:木造|鉄筋|RC|SRC)(?:造|構造)?)',
-                r'((?:\d+階建て?|\d+F))',
-            ],
-            'room_layout': [
-                r'(\d+[LDKS]{1,4})',
-                r'(\d+(?:部屋|室))',
-                r'([1-9][LDKS](?:\+[LDKS])*)',
             ]
         }
 
 
 class GmailAPIProcessor:
-    """Enhanced Gmail API processor with improved Japanese text handling and persistent authentication"""
+    """Enhanced Gmail API processor with improved handling and archiving"""
     
-    SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+    SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.modify']
     
-    def __init__(self, credentials_path: str, token_path: str, webhook_url: str):
+    def __init__(self, webhook_url: str = None):
         """
         Initialize Gmail API processor
         
         Args:
-            credentials_path: Path to credentials.json file
-            token_path: Path to token.json file
-            webhook_url: Webhook URL to send processed data
+            webhook_url: Webhook URL to send processed data (can be set via env var)
         """
-        self.credentials_path = credentials_path
-        self.token_path = token_path
-        self.webhook_url = webhook_url
+        # Get configuration from environment variables
+        self.credentials_path = os.getenv('GMAIL_CREDENTIALS_PATH', 'credentials.json')
+        self.token_path = os.getenv('GMAIL_TOKEN_PATH', 'token.json')
+        self.webhook_url = webhook_url or os.getenv('WEBHOOK_URL')
+        self.max_emails = int(os.getenv('MAX_EMAILS_PER_CHECK', '10'))
+        self.archive_processed = os.getenv('ARCHIVE_PROCESSED_EMAILS', 'true').lower() == 'true'
+        
+        # Initialize components
         self.service = None
-        self.processed_emails = set()
+        self.db = EmailDatabase()
         self.universal_json = UniversalJSONProcessor()
         self._auth_lock = threading.Lock()
         
-        # Load processed emails from file if exists
-        self.load_processed_emails()
+        logger.info(f"Email processor initialized with webhook: {self.webhook_url}")
         
-    def load_processed_emails(self):
-        """Load previously processed email IDs from file"""
-        try:
-            if os.path.exists('processed_emails.json'):
-                with open('processed_emails.json', 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    self.processed_emails = set(data.get('processed_ids', []))
-                    logger.info(f"Loaded {len(self.processed_emails)} processed email IDs")
-        except Exception as e:
-            logger.error(f"Error loading processed emails: {e}")
-    
-    def save_processed_emails(self):
-        """Save processed email IDs to file"""
-        try:
-            with open('processed_emails.json', 'w', encoding='utf-8') as f:
-                json.dump({
-                    'processed_ids': list(self.processed_emails),
-                    'last_updated': datetime.now().isoformat()
-                }, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving processed emails: {e}")
-    
     def authenticate(self) -> bool:
-        """Authenticate and build Gmail service using existing credentials with persistent token handling"""
+        """Authenticate and build Gmail service with persistent token handling"""
         with self._auth_lock:
             try:
                 creds = None
@@ -464,7 +569,7 @@ class GmailAPIProcessor:
                 # Build the Gmail service
                 self.service = build('gmail', 'v1', credentials=creds)
                 
-                # Test the service with a simple call
+                # Test the service
                 try:
                     profile = self.service.users().getProfile(userId='me').execute()
                     logger.info(f"Gmail API authentication successful for {profile.get('emailAddress', 'unknown')}")
@@ -477,27 +582,19 @@ class GmailAPIProcessor:
                 logger.error(f"Authentication failed: {e}")
                 return False
     
-    def get_latest_emails(self, max_results: int = 10) -> List[Dict]:
-        """
-        Get latest emails from inbox with improved error handling
-        
-        Args:
-            max_results: Maximum number of emails to fetch
-            
-        Returns:
-            List of email dictionaries with metadata
-        """
+    def get_latest_emails(self) -> List[Dict]:
+        """Get latest unprocessed emails from inbox"""
         try:
             if not self.service:
                 if not self.authenticate():
                     return []
             
-            # Get list of emails (latest first)
+            # Get list of emails
             try:
                 results = self.service.users().messages().list(
                     userId='me',
                     labelIds=['INBOX'],
-                    maxResults=max_results
+                    maxResults=self.max_emails * 2  # Get more to account for already processed
                 ).execute()
             except HttpError as e:
                 if e.resp.status == 401:
@@ -506,7 +603,7 @@ class GmailAPIProcessor:
                         results = self.service.users().messages().list(
                             userId='me',
                             labelIds=['INBOX'],
-                            maxResults=max_results
+                            maxResults=self.max_emails * 2
                         ).execute()
                     else:
                         return []
@@ -519,17 +616,23 @@ class GmailAPIProcessor:
                 logger.info("No messages found in inbox")
                 return []
             
+            # Filter out already processed emails and get email data
             emails = []
+            processed_count = 0
+            
             for message in messages:
+                email_id = message['id']
+                
                 # Skip if already processed
-                if message['id'] in self.processed_emails:
+                if self.db.is_email_processed(email_id):
+                    processed_count += 1
                     continue
                 
                 try:
                     # Get full message
                     msg = self.service.users().messages().get(
                         userId='me', 
-                        id=message['id'],
+                        id=email_id,
                         format='full'
                     ).execute()
                     
@@ -537,16 +640,18 @@ class GmailAPIProcessor:
                     email_data = self.extract_email_data(msg)
                     if email_data:
                         emails.append(email_data)
+                        
+                        # Stop if we have enough new emails
+                        if len(emails) >= self.max_emails:
+                            break
+                            
                 except Exception as e:
-                    logger.error(f"Error processing email {message['id']}: {e}")
+                    logger.error(f"Error processing email {email_id}: {e}")
                     continue
             
-            logger.info(f"Retrieved {len(emails)} new emails")
+            logger.info(f"Retrieved {len(emails)} new emails ({processed_count} already processed)")
             return emails
             
-        except HttpError as error:
-            logger.error(f"Gmail API error: {error}")
-            return []
         except Exception as e:
             logger.error(f"Error getting emails: {e}")
             return []
@@ -647,15 +752,7 @@ class GmailAPIProcessor:
             return ""
     
     def check_data_relevance(self, email_data: Dict) -> bool:
-        """
-        Enhanced relevance check for Japanese content
-        
-        Args:
-            email_data: Email data dictionary
-            
-        Returns:
-            True if email contains relevant data, False otherwise
-        """
+        """Enhanced relevance check for Japanese content"""
         subject = email_data.get('subject', '').lower()
         body = email_data.get('body', '').lower()
         email_text = f"{subject} {body}"
@@ -667,84 +764,54 @@ class GmailAPIProcessor:
             'メール', 'email', 'e-mail', 'アドレス', 'メルアド',
             '電話', 'tel', 'phone', '番号', 'でんわ', '携帯',
             '住所', 'address', '所在地', 'じゅうしょ',
-            '年齢', 'age', '歳', '才',
             
             # Form and inquiry keywords
             'フォーム', 'form', 'お問い合わせ', '問い合わせ', '問合せ', 'inquiry',
             '申込', '申し込み', 'application', '登録', 'registration',
             '予約', 'reservation', 'booking', 'よやく',
             '相談', 'consultation', '見学', 'けんがく',
-            'セミナー', 'seminar', 'イベント', 'event',
             
             # Real estate keywords
             '物件', 'property', '不動産', 'real estate', 'ぶっけん',
             '住宅', 'house', 'housing', 'じゅうたく',
             'マンション', 'mansion', 'アパート', 'apartment',
             '戸建', '一戸建て', 'house', 'こだて',
-            '土地', 'land', 'とち',
-            '賃貸', 'rental', 'ちんたい',
-            '売買', 'sales', 'ばいばい',
-            
-            # Company and service keywords
-            '会社', 'company', '企業', 'きぎょう',
-            'サービス', 'service', 'しゃーびす',
-            '資料', 'materials', '資料請求', 'しりょう',
-            '説明会', 'briefing', 'せつめいかい',
             
             # Lark specific
-            'lark', 'larksuite', '飛書', 'feishu',
-            'webhook', 'api'
+            'lark', 'larksuite', '飛書', 'feishu', 'webhook', 'api'
         ]
         
         # Check if any relevance keywords are present
-        keyword_found = False
-        for keyword in relevance_keywords:
-            if keyword in email_text:
-                logger.info(f"Found relevant keyword: {keyword}")
-                keyword_found = True
-                break
+        keyword_found = any(keyword in email_text for keyword in relevance_keywords)
         
         # Enhanced pattern checking for structured data
         patterns_found = 0
         structure_patterns = [
-            r'[：:]\s*[^\n]',  # Colon patterns common in forms
+            r'[：:]\s*[^\n]',  # Colon patterns
             r'お客様情報',
             r'ご質問.*[：:]',
             r'申し込み.*[：:]',
             r'フォーム',
-            r'[^\s]+\s*[：:]\s*[^\s]',  # General field: value pattern
-            r'\d+-\d+-\d+',  # Phone or postal code pattern
+            r'\d+-\d+-\d+',  # Phone/postal patterns
             r'@[a-zA-Z0-9.-]+\.',  # Email pattern
-            r'[都道府県市区町村]',  # Japanese address components
-            r'\d+(?:万|千|億)円',  # Japanese price patterns
-            r'[月火水木金土日]曜日',  # Japanese day patterns
+            r'[都道府県市区町村]',  # Japanese address
+            r'\d+(?:万|千|億)円',  # Price patterns
         ]
         
         for pattern in structure_patterns:
             if re.search(pattern, email_text, re.IGNORECASE):
                 patterns_found += 1
-                logger.info(f"Found relevant pattern: {pattern}")
         
-        # More lenient check - accept if keyword found OR multiple patterns found
+        # Accept if keyword found OR multiple patterns found
         is_relevant = keyword_found or patterns_found >= 2
         
         if is_relevant:
             logger.info(f"Email marked as relevant (keywords: {keyword_found}, patterns: {patterns_found})")
-        else:
-            logger.info(f"Email not relevant (keywords: {keyword_found}, patterns: {patterns_found})")
         
         return is_relevant
     
     def extract_universal_json_data(self, email_data: Dict) -> Dict:
-        """
-        Extract and map data to universal JSON format with enhanced Japanese processing
-        
-        Args:
-            email_data: Processed email data
-            
-        Returns:
-            Universal JSON format dictionary
-        """
+        """Extract and map data to universal JSON format"""
         # Get universal template
         universal_data = self.universal_json.get_universal_template()
         patterns = self.universal_json.extract_patterns()
@@ -771,10 +838,7 @@ class GmailAPIProcessor:
                 try:
                     match = re.search(pattern, full_text, re.MULTILINE | re.DOTALL | re.IGNORECASE)
                     if match:
-                        if match.groups():
-                            value = match.group(1).strip()
-                        else:
-                            value = match.group(0).strip()
+                        value = match.group(1).strip() if match.groups() else match.group(0).strip()
                         
                         # Clean and validate the extracted value
                         value = self.clean_extracted_value(value, field)
@@ -786,7 +850,7 @@ class GmailAPIProcessor:
                             logger.info(f"Extracted {field}: {value}")
                             break
                 except Exception as e:
-                    logger.warning(f"Error processing pattern {pattern} for field {field}: {e}")
+                    logger.warning(f"Error processing pattern for field {field}: {e}")
                     continue
         
         # Log extraction summary
@@ -808,18 +872,15 @@ class GmailAPIProcessor:
         
         # Field-specific cleaning
         if field == 'email':
-            # Extract only the email address if there's extra text
             email_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', value)
             if email_match:
                 value = email_match.group(1)
         
         elif field == 'phone':
-            # Normalize phone numbers
             value = re.sub(r'[^\d\-\(\)\s]', '', value)
             value = re.sub(r'\s+', ' ', value).strip()
         
         elif field == 'postal_code':
-            # Ensure postal code format
             digits = re.findall(r'\d', value)
             if len(digits) == 7:
                 value = f"{digits[0]}{digits[1]}{digits[2]}-{digits[3]}{digits[4]}{digits[5]}{digits[6]}"
@@ -827,7 +888,6 @@ class GmailAPIProcessor:
                 return ""
         
         elif field in ['age']:
-            # Extract numbers only for age
             numbers = re.findall(r'\d+', value)
             if numbers:
                 age = int(numbers[0])
@@ -839,33 +899,27 @@ class GmailAPIProcessor:
                 return ""
         
         elif field == 'url':
-            # Ensure URL format
             if not value.startswith(('http://', 'https://')):
                 if value.startswith('www.'):
                     value = 'https://' + value
                 elif '.' in value and not value.startswith('//'):
                     value = 'https://' + value
         
-        # Remove common unwanted suffixes/prefixes
+        # Remove unwanted patterns
         unwanted_patterns = [
             r'^\s*[：:]\s*',  # Leading colon
-            r'\s*[：:]\s*'
-            ,  # Trailing colon
-            r'^.*?[：:]\s*',  # Everything before colon (only if there's text after)
-            r'\s*様\s*'
-            ,    # Honorific suffix
-            r'\s*さん\s*'
-            ,   # Honorific suffix
-            r'\s*殿\s*'
-            ,     # Honorific suffix
+            r'\s*[：:]\s*',
+            r'^.*?[：:]\s*',    # Trailing colon
+            r'\s*様\s*',     # Honorific suffix
+            r'\s*さん\s*',
+            r'\s*殿\s*',   # Honorific suffix
         ]
         
         for pattern in unwanted_patterns:
             value = re.sub(pattern, '', value).strip()
         
-        # Return empty string if value is too short or contains only special characters
-        if len(value) < 1 or re.match(r'^[^\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]+$'
-            , value):
+        # Return empty if too short or only special characters
+        if len(value) < 1 or re.match(r'^[^\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]+$', value):
             return ""
         
         return value
@@ -876,6 +930,7 @@ class GmailAPIProcessor:
             if not value or len(value.strip()) == 0:
                 return
             
+            # Customer info mappings
             if field == 'name':
                 universal_data["customer_info(お客様情報)"][0]["name(お名前)"] = value
             elif field == 'furigana':
@@ -894,42 +949,15 @@ class GmailAPIProcessor:
                 universal_data["customer_info(お客様情報)"][0]["postal_code(郵便番号)"] = value
             elif field == 'address':
                 universal_data["customer_info(お客様情報)"][0]["address(ご住所)"] = value
-            elif field == 'company_name':
-                universal_data["company_info(会社情報)"]["company_name(会社名)"] = value
-                universal_data["property_info(物件情報)"]["company_name(会社名)"] = value
-            elif field == 'branch_name':
-                universal_data["company_info(会社情報)"]["branch_name(支店名)"] = value
-                universal_data["property_info(物件情報)"]["branch_name(支店名)"] = value
-            elif field == 'event_name':
-                universal_data["event_info(イベント情報)"]["event_name(イベント名)"] = value
-            elif field == 'event_date':
-                universal_data["event_info(イベント情報)"]["event_date(開催日)"] = value
-            elif field == 'event_time':
-                universal_data["event_info(イベント情報)"]["event_time(時間)"] = value
-            elif field == 'event_place':
-                universal_data["event_info(イベント情報)"]["event_place(会場)"] = value
-                universal_data["reservation_info(ご予約情報)"][0]["meeting_place(集合場所)"] = value
-            elif field == 'preferred_date':
-                universal_data["reservation_info(ご予約情報)"][0]["preferred_date(ご希望日)"] = value
-            elif field == 'preferred_time':
-                universal_data["reservation_info(ご予約情報)"][0]["preferred_time(ご希望時間)"] = value
             elif field == 'inquiry_text':
                 universal_data["inquiry_info(お問い合わせ内容)"]["inquiry_text(お問い合わせ内容)"] = value
                 universal_data["customer_info(お客様情報)"][0]["comments(ご意見・ご質問等)"] = value
-            elif field == 'inquiry_source':
-                universal_data["inquiry_info(お問い合わせ内容)"]["inquiry_source(お問い合わせのきっかけ)"] = value
-                universal_data["customer_info(お客様情報)"][0]["registration_reason(会員登録のきっかけ)"] = value
-            elif field == 'budget_monthly':
-                universal_data["customer_info(お客様情報)"][0]["monthly_payment(月々の返済額)"] = value
-                universal_data["survey_info(アンケート情報)"]["budget_monthly(希望返済額)"] = value
-            elif field == 'monthly_rent':
-                universal_data["customer_info(お客様情報)"][0]["monthly_rent(月々の家賃)"] = value
+            elif field == 'company_name':
+                universal_data["company_info(会社情報)"]["company_name(会社名)"] = value
+                universal_data["property_info(物件情報)"]["company_name(会社名)"] = value
             elif field == 'property_name':
                 universal_data["property_info(物件情報)"]["property_name(物件名)"] = value
                 universal_data["reservation_info(ご予約情報)"][0]["property_name(物件名)"] = value
-            elif field == 'property_type':
-                universal_data["property_info(物件情報)"]["property_type(物件種別)"] = value
-                universal_data["reservation_info(ご予約情報)"][0]["property_type(物件種別)"] = value
             elif field == 'price':
                 universal_data["property_info(物件情報)"]["price(価格)"] = value
                 universal_data["reservation_info(ご予約情報)"][0]["price(価格)"] = value
@@ -937,28 +965,16 @@ class GmailAPIProcessor:
                 universal_data["company_info(会社情報)"]["url(URL)"] = value
                 universal_data["event_info(イベント情報)"]["event_url(URL)"] = value
                 universal_data["property_info(物件情報)"]["property_url(物件詳細画面)"] = value
-            elif field == 'room_layout':
-                universal_data["property_info(物件情報)"]["floor_plan(間取り)"] = value
-            elif field == 'prefecture':
-                # Add to address if not already there
-                current_address = universal_data["customer_info(お客様情報)"][0]["address(ご住所)"]
-                if not current_address:
-                    universal_data["customer_info(お客様情報)"][0]["address(ご住所)"] = value
-                elif value not in current_address:
-                    universal_data["customer_info(お客様情報)"][0]["address(ご住所)"] = f"{value} {current_address}"
-            elif field == 'city':
-                # Add to address if not already there
-                current_address = universal_data["customer_info(お客様情報)"][0]["address(ご住所)"]
-                if not current_address:
-                    universal_data["customer_info(お客様情報)"][0]["address(ご住所)"] = value
-                elif value not in current_address:
-                    universal_data["customer_info(お客様情報)"][0]["address(ご住所)"] = f"{current_address} {value}"
                     
         except Exception as e:
             logger.error(f"Error mapping field {field} with value '{value}': {e}")
     
     def send_to_webhook(self, data: Dict) -> bool:
         """Send processed data to webhook with retry logic"""
+        if not self.webhook_url:
+            logger.warning("No webhook URL configured, skipping webhook send")
+            return False
+            
         max_retries = 3
         retry_delay = 1
         
@@ -966,7 +982,7 @@ class GmailAPIProcessor:
             try:
                 headers = {
                     'Content-Type': 'application/json',
-                    'User-Agent': 'Email-Processor/1.0'
+                    'User-Agent': 'Email-Processor/2.0'
                 }
                 
                 response = requests.post(
@@ -996,81 +1012,47 @@ class GmailAPIProcessor:
         logger.error("Failed to send to webhook after all retry attempts")
         return False
     
-    def save_processed_data(self, email_data: Dict, universal_data: Dict):
-        """Save processed data to local file for debugging and backup"""
+    def archive_email(self, email_id: str) -> bool:
+        """Archive processed email (remove from inbox)"""
+        if not self.archive_processed:
+            return True  # Skip archiving if disabled
+            
         try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            email_id = email_data.get('id', 'unknown')[:8]  # First 8 chars of ID
-            filename = f"processed_data_{timestamp}_{email_id}.json"
+            # Remove inbox label to archive the email
+            self.service.users().messages().modify(
+                userId='me',
+                id=email_id,
+                body={
+                    'removeLabelIds': ['INBOX']
+                }
+            ).execute()
             
-            save_data = {
-                'email_metadata': {
-                    'id': email_data.get('id'),
-                    'subject': email_data.get('subject'),
-                    'sender': email_data.get('sender'),
-                    'date': email_data.get('formatted_date'),
-                    'body_length': len(email_data.get('body', ''))
-                },
-                'universal_json_data': universal_data,
-                'processed_at': datetime.now().isoformat(),
-                'webhook_url': self.webhook_url
-            }
-            
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(save_data, f, ensure_ascii=False, indent=2)
-            
-            logger.info(f"Processed data saved to: {filename}")
-            
-            # Clean up old files (keep only last 50)
-            self._cleanup_old_files()
+            logger.info(f"Archived email {email_id}")
+            return True
             
         except Exception as e:
-            logger.error(f"Error saving processed data: {e}")
+            logger.error(f"Failed to archive email {email_id}: {e}")
+            return False
     
-    def _cleanup_old_files(self):
-        """Clean up old processed data files to prevent disk space issues"""
+    def process_emails(self) -> Dict:
+        """Main processing function - returns processing results"""
         try:
-            # Get all processed data files
-            files = []
-            for filename in os.listdir('.'):
-                if filename.startswith('processed_data_') and filename.endswith('.json'):
-                    try:
-                        stat = os.stat(filename)
-                        files.append((filename, stat.st_mtime))
-                    except OSError:
-                        pass
-            
-            # Sort by modification time (newest first)
-            files.sort(key=lambda x: x[1], reverse=True)
-            
-            # Keep only the 50 most recent files
-            if len(files) > 50:
-                for filename, _ in files[50:]:
-                    try:
-                        os.remove(filename)
-                        logger.info(f"Removed old processed data file: {filename}")
-                    except OSError as e:
-                        logger.warning(f"Could not remove old file {filename}: {e}")
-                        
-        except Exception as e:
-            logger.warning(f"Error cleaning up old files: {e}")
-    
-    def process_emails(self) -> int:
-        """
-        Main processing function - get emails, extract data, send to webhook
-        
-        Returns:
-            Number of emails processed successfully
-        """
-        try:
-            # Get latest emails
+            # Get latest unprocessed emails
             emails = self.get_latest_emails()
             
             if not emails:
                 logger.info("No new emails to process")
-                return 0
+                return {
+                    'processed': 0,
+                    'successful_webhooks': 0,
+                    'failed_webhooks': 0,
+                    'archived': 0
+                }
             
             processed_count = 0
+            successful_webhooks = 0
+            failed_webhooks = 0
+            archived_count = 0
             
             for email_data in emails:
                 email_id = email_data.get('id', 'unknown')
@@ -1082,14 +1064,15 @@ class GmailAPIProcessor:
                 try:
                     # Check if email contains relevant data
                     if not self.check_data_relevance(email_data):
-                        logger.info(f"Email {email_id} - No relevant data found, skipping")
-                        self.processed_emails.add(email_id)
+                        logger.info(f"Email {email_id} - No relevant data found, marking as processed")
+                        self.db.mark_email_processed(email_data, webhook_sent=False)
+                        processed_count += 1
                         continue
                     
                     # Extract universal JSON data
                     universal_data = self.extract_universal_json_data(email_data)
                     
-                    # Check if we extracted any meaningful data
+                    # Check if we extracted meaningful customer data
                     has_customer_data = any([
                         universal_data["customer_info(お客様情報)"][0]["name(お名前)"],
                         universal_data["customer_info(お客様情報)"][0]["email(メールアドレス)"],
@@ -1099,57 +1082,76 @@ class GmailAPIProcessor:
                     
                     if not has_customer_data:
                         logger.info(f"Email {email_id} - No extractable customer data found")
-                        self.processed_emails.add(email_id)
+                        self.db.mark_email_processed(email_data, universal_data, webhook_sent=False)
+                        processed_count += 1
                         continue
-                    
-                    # Save processed data locally
-                    self.save_processed_data(email_data, universal_data)
                     
                     # Send to webhook
                     webhook_success = self.send_to_webhook(universal_data)
                     
                     if webhook_success:
-                        logger.info(f"Successfully processed email {email_id}")
-                        processed_count += 1
+                        logger.info(f"Successfully processed and sent webhook for email {email_id}")
+                        successful_webhooks += 1
                     else:
                         logger.error(f"Failed to send webhook for email {email_id}")
+                        failed_webhooks += 1
                     
-                    # Mark as processed regardless of webhook success to avoid reprocessing
-                    self.processed_emails.add(email_id)
+                    # Mark as processed in database
+                    self.db.mark_email_processed(email_data, universal_data, webhook_sent=webhook_success)
+                    processed_count += 1
+                    
+                    # Archive email if configured
+                    if self.archive_email(email_id):
+                        archived_count += 1
                     
                 except Exception as e:
                     logger.error(f"Error processing email {email_id}: {e}")
-                    # Still mark as processed to avoid infinite retries on corrupted emails
-                    self.processed_emails.add(email_id)
+                    # Still mark as processed to avoid infinite retries
+                    self.db.mark_email_processed(email_data, webhook_sent=False)
+                    processed_count += 1
+                    failed_webhooks += 1
                     continue
             
-            # Save processed email IDs
-            self.save_processed_emails()
+            # Update statistics
+            self.db.update_daily_stats(processed_count, successful_webhooks, failed_webhooks)
             
-            logger.info(f"Processing completed: {processed_count} emails successfully processed")
-            return processed_count
+            results = {
+                'processed': processed_count,
+                'successful_webhooks': successful_webhooks,
+                'failed_webhooks': failed_webhooks,
+                'archived': archived_count
+            }
+            
+            logger.info(f"Processing completed: {results}")
+            return results
             
         except Exception as e:
             logger.error(f"Critical error in process_emails: {e}")
-            return 0
+            return {
+                'processed': 0,
+                'successful_webhooks': 0,
+                'failed_webhooks': 0,
+                'archived': 0,
+                'error': str(e)
+            }
     
-    def run_continuous(self, interval_seconds: int = 20):
-        """
-        Run email processing continuously
-        
-        Args:
-            interval_seconds: Seconds between email checks (default 20)
-        """
+    def run_continuous(self, interval_seconds: int = None):
+        """Run email processing continuously"""
+        if interval_seconds is None:
+            interval_seconds = int(os.getenv('CHECK_INTERVAL_SECONDS', '60'))
+            
         logger.info(f"Starting continuous email processing (checking every {interval_seconds} seconds)")
         
         while True:
             try:
                 logger.info("=" * 50)
                 logger.info("Checking for new emails...")
-                processed = self.process_emails()
+                results = self.process_emails()
                 
-                if processed > 0:
-                    logger.info(f"✓ Processed {processed} emails in this cycle")
+                if results['processed'] > 0:
+                    logger.info(f"✓ Processed {results['processed']} emails, "
+                              f"{results['successful_webhooks']} webhooks successful, "
+                              f"{results['archived']} archived")
                 else:
                     logger.info("✓ No new emails to process")
                 
@@ -1164,121 +1166,33 @@ class GmailAPIProcessor:
                 logger.info("Waiting 60 seconds before retrying...")
                 time.sleep(60)
     
-    def run_once(self) -> int:
-        """Run processing once and return number of processed emails"""
+    def run_once(self) -> Dict:
+        """Run processing once and return results"""
         logger.info("Running email processing once...")
         try:
-            processed = self.process_emails()
-            logger.info(f"One-time processing completed: {processed} emails processed")
-            return processed
+            results = self.process_emails()
+            logger.info(f"One-time processing completed: {results}")
+            return results
         except Exception as e:
             logger.error(f"Error in run_once: {e}")
-            return 0
-
-
-class EmailProcessorStats:
-    """Statistics and monitoring for email processor with better persistence"""
-    
-    def __init__(self):
-        self.stats_file = 'processor_stats.json'
-        self.stats = self.load_stats()
-        self._lock = threading.Lock()
-    
-    def load_stats(self) -> Dict:
-        """Load processing statistics"""
-        try:
-            if os.path.exists(self.stats_file):
-                with open(self.stats_file, 'r', encoding='utf-8') as f:
-                    stats = json.load(f)
-                    # Ensure all required fields exist
-                    default_stats = {
-                        'total_processed': 0,
-                        'successful_webhooks': 0,
-                        'failed_webhooks': 0,
-                        'last_run': None,
-                        'daily_stats': {},
-                        'created_at': datetime.now().isoformat(),
-                        'last_updated': datetime.now().isoformat()
-                    }
-                    
-                    for key, default_value in default_stats.items():
-                        if key not in stats:
-                            stats[key] = default_value
-                    
-                    return stats
-        except Exception as e:
-            logger.error(f"Error loading stats: {e}")
-        
-        # Return default stats if loading fails
-        return {
-            'total_processed': 0,
-            'successful_webhooks': 0,
-            'failed_webhooks': 0,
-            'last_run': None,
-            'daily_stats': {},
-            'created_at': datetime.now().isoformat(),
-            'last_updated': datetime.now().isoformat()
-        }
-    
-    def save_stats(self):
-        """Save statistics to file with thread safety"""
-        with self._lock:
-            try:
-                self.stats['last_updated'] = datetime.now().isoformat()
-                with open(self.stats_file, 'w', encoding='utf-8') as f:
-                    json.dump(self.stats, f, indent=2, ensure_ascii=False)
-            except Exception as e:
-                logger.error(f"Error saving stats: {e}")
-    
-    def update_stats(self, processed: int, successful: int):
-        """Update processing statistics with thread safety"""
-        with self._lock:
-            today = datetime.now().strftime('%Y-%m-%d')
-            
-            self.stats['total_processed'] += processed
-            self.stats['successful_webhooks'] += successful
-            self.stats['failed_webhooks'] += (processed - successful)
-            self.stats['last_run'] = datetime.now().isoformat()
-            
-            if today not in self.stats['daily_stats']:
-                self.stats['daily_stats'][today] = {
-                    'processed': 0,
-                    'successful': 0,
-                    'failed': 0,
-                    'first_run': datetime.now().isoformat()
-                }
-            
-            self.stats['daily_stats'][today]['processed'] += processed
-            self.stats['daily_stats'][today]['successful'] += successful
-            self.stats['daily_stats'][today]['failed'] += (processed - successful)
-            self.stats['daily_stats'][today]['last_run'] = datetime.now().isoformat()
-            
-            # Clean up old daily stats (keep only last 30 days)
-            cutoff_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-            old_dates = [date for date in self.stats['daily_stats'].keys() if date < cutoff_date]
-            for old_date in old_dates:
-                del self.stats['daily_stats'][old_date]
-            
-            self.save_stats()
-            logger.info(f"Stats updated: Total processed={self.stats['total_processed']}, Today processed={self.stats['daily_stats'][today]['processed']}")
+            return {'processed': 0, 'error': str(e)}
     
     def get_stats(self) -> Dict:
-        """Get current statistics"""
-        with self._lock:
-            return self.stats.copy()
+        """Get processing statistics from database"""
+        return self.db.get_stats()
     
-    def get_daily_stats(self, days: int = 7) -> Dict:
-        """Get statistics for recent days"""
-        with self._lock:
-            daily_stats = {}
-            for i in range(days):
-                date = (datetime.now().date() - timedelta(days=i)).strftime('%Y-%m-%d')
-                daily_stats[date] = self.stats['daily_stats'].get(date, {
-                    'processed': 0,
-                    'successful': 0,
-                    'failed': 0
-                })
-            return daily_stats
+    def get_recent_emails(self) -> List[Dict]:
+        """Get recently processed emails from database"""
+        return self.db.get_recent_processed_emails()
+    
+    def clear_processed_data(self) -> bool:
+        """Clear all processed email data"""
+        try:
+            self.db.clear_all_data()
+            return True
+        except Exception as e:
+            logger.error(f"Error clearing processed data: {e}")
+            return False
 
 
 def main():
@@ -1286,71 +1200,47 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Gmail Email Processor for Japanese Real Estate Forms')
-    parser.add_argument('--credentials', '-c', default='credentials.json', 
-                       help='Path to Gmail API credentials file (default: credentials.json)')
-    parser.add_argument('--token', '-t', default='token.json',
-                       help='Path to token file (default: token.json)')
-    parser.add_argument('--webhook', '-w', required=True,
-                       help='Webhook URL to send processed data')
-    parser.add_argument('--interval', '-i', type=int, default=20,
-                       help='Check interval in seconds for continuous mode (default: 20)')
+    parser.add_argument('--webhook', '-w', 
+                       help='Webhook URL (or set WEBHOOK_URL env var)')
+    parser.add_argument('--interval', '-i', type=int, 
+                       help='Check interval in seconds (default: 60)')
     parser.add_argument('--once', action='store_true',
                        help='Run once instead of continuous mode')
-    parser.add_argument('--max-emails', '-m', type=int, default=10,
-                       help='Maximum number of emails to fetch per check (default: 10)')
     parser.add_argument('--stats', '-s', action='store_true',
                        help='Show processing statistics and exit')
     
     args = parser.parse_args()
     
-    # Show stats if requested
-    if args.stats:
-        stats = EmailProcessorStats()
-        current_stats = stats.get_stats()
-        daily_stats = stats.get_daily_stats(7)
-        
-        print("\n=== Email Processor Statistics ===")
-        print(f"Total processed: {current_stats.get('total_processed', 0)}")
-        print(f"Successful webhooks: {current_stats.get('successful_webhooks', 0)}")
-        print(f"Failed webhooks: {current_stats.get('failed_webhooks', 0)}")
-        print(f"Last run: {current_stats.get('last_run', 'Never')}")
-        
-        print("\n=== Daily Statistics (Last 7 days) ===")
-        for date, stats_data in daily_stats.items():
-            if stats_data['processed'] > 0:
-                print(f"{date}: {stats_data['processed']} processed, {stats_data['successful']} successful")
-        return
-    
-    # Validate required files and parameters
-    if not os.path.exists(args.credentials):
-        logger.error(f"Credentials file not found: {args.credentials}")
-        logger.error("Please download credentials.json from Google Cloud Console")
-        return
-    
-    if not args.webhook:
-        logger.error("Webhook URL is required")
-        return
-    
     # Initialize processor
     try:
-        processor = GmailAPIProcessor(
-            credentials_path=args.credentials,
-            token_path=args.token,
-            webhook_url=args.webhook
-        )
+        processor = GmailAPIProcessor(webhook_url=args.webhook)
         
-        # Initialize stats tracking
-        stats = EmailProcessorStats()
+        # Show stats if requested
+        if args.stats:
+            stats = processor.get_stats()
+            recent_emails = processor.get_recent_emails()
+            
+            print("\n=== Email Processor Statistics ===")
+            print(f"Total processed: {stats.get('total_processed', 0)}")
+            print(f"Successful webhooks: {stats.get('successful_webhooks', 0)}")
+            print(f"Failed webhooks: {stats.get('failed_webhooks', 0)}")
+            print(f"Today processed: {stats.get('today_processed', 0)}")
+            print(f"Today successful: {stats.get('today_successful', 0)}")
+            
+            if recent_emails:
+                print("\n=== Recent Processed Emails ===")
+                for email in recent_emails[:5]:
+                    print(f"- {email['subject']} from {email['sender']} ({email['processed_date']})")
+            return
         
         logger.info("Email processor initialized successfully")
-        logger.info(f"Credentials: {args.credentials}")
-        logger.info(f"Token: {args.token}")
-        logger.info(f"Webhook: {args.webhook}")
         
         if args.once:
             # Run once
-            processed = processor.run_once()
-            stats.update_stats(processed, processed)  # Assume all processed emails were successful
+            results = processor.run_once()
+            if 'error' in results:
+                logger.error(f"Processing failed: {results['error']}")
+                exit(1)
         else:
             # Run continuously
             processor.run_continuous(args.interval)

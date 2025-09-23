@@ -78,7 +78,7 @@
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 2rem;
+            font-size: 1.2rem;
             font-weight: bold;
             color: white;
             transition: all 0.3s ease;
@@ -123,9 +123,15 @@
             letter-spacing: 0.5px;
         }
         
-        .btn:hover {
+        .btn:hover:not(:disabled) {
             transform: translateY(-2px);
             box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+        
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
         }
         
         .btn-primary {
@@ -155,7 +161,7 @@
         
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
             gap: 15px;
         }
         
@@ -167,15 +173,19 @@
         }
         
         .stat-number {
-            font-size: 2rem;
+            font-size: 1.8rem;
             font-weight: bold;
             color: #2196F3;
         }
         
         .stat-label {
-            font-size: 0.9rem;
+            font-size: 0.85rem;
             color: #6c757d;
             margin-top: 5px;
+        }
+        
+        .config-section {
+            margin-bottom: 20px;
         }
         
         .form-group {
@@ -204,29 +214,13 @@
             box-shadow: 0 0 0 3px rgba(33, 150, 243, 0.1);
         }
         
-        .logs-container {
-            background: #1a1a1a;
-            color: #00ff00;
-            padding: 20px;
-            border-radius: 10px;
-            font-family: 'Courier New', monospace;
-            max-height: 400px;
-            overflow-y: auto;
-            margin-top: 15px;
-        }
-        
-        .log-entry {
-            margin-bottom: 5px;
-            font-size: 12px;
-        }
-        
         .recent-emails {
             max-height: 300px;
             overflow-y: auto;
         }
         
         .email-item {
-            padding: 10px;
+            padding: 12px;
             border-bottom: 1px solid #eee;
             transition: background-color 0.2s ease;
         }
@@ -239,11 +233,28 @@
             font-weight: 600;
             color: #2196F3;
             margin-bottom: 5px;
+            word-break: break-word;
         }
         
         .email-meta {
-            font-size: 0.9rem;
+            font-size: 0.85rem;
             color: #6c757d;
+        }
+        
+        .logs-container {
+            background: #1a1a1a;
+            color: #00ff00;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            max-height: 250px;
+            overflow-y: auto;
+            font-size: 11px;
+        }
+        
+        .log-entry {
+            margin-bottom: 3px;
+            word-break: break-all;
         }
         
         .notification {
@@ -257,6 +268,7 @@
             z-index: 1000;
             transform: translateX(100%);
             transition: transform 0.3s ease;
+            max-width: 400px;
         }
         
         .notification.show {
@@ -271,11 +283,27 @@
             background: linear-gradient(45deg, #f44336, #d32f2f);
         }
         
+        .notification.warning {
+            background: linear-gradient(45deg, #ff9800, #f57c00);
+        }
+        
         .last-update {
             text-align: center;
-            color: #6c757d;
+            color: rgba(255,255,255,0.8);
             font-size: 0.9rem;
             margin-top: 20px;
+        }
+        
+        .loading {
+            opacity: 0.6;
+            pointer-events: none;
+        }
+        
+        .config-note {
+            font-size: 0.8rem;
+            color: #6c757d;
+            margin-top: 3px;
+            font-style: italic;
         }
         
         @media (max-width: 768px) {
@@ -291,13 +319,13 @@
                 grid-template-columns: 1fr;
             }
             
-            .controls {
-                justify-content: center;
-            }
-            
             .btn {
                 flex: 1;
-                min-width: 120px;
+                min-width: 100px;
+            }
+            
+            .stats-grid {
+                grid-template-columns: repeat(2, 1fr);
             }
         }
     </style>
@@ -306,15 +334,15 @@
     <div class="container">
         <div class="header">
             <h1>📧 Email Processor Dashboard</h1>
-            <p>Gmail監視・データ抽出・Webhook送信システム</p>
+            <p>Gmail監視・データ抽出・Webhook送信システム v2.0</p>
         </div>
         
         <div class="dashboard-grid">
             <!-- Status Card -->
             <div class="card status-card">
-                <h3>🚀 システム状態</h3>
+                <h3>システム状態</h3>
                 <div id="statusIndicator" class="status-indicator status-stopped">
-                    停止
+                    停止中
                 </div>
                 <p id="statusText">プロセッサは停止中です</p>
                 <div class="controls">
@@ -331,37 +359,49 @@
                 <div class="stats-grid">
                     <div class="stat-item">
                         <div id="totalProcessed" class="stat-number">0</div>
-                        <div class="stat-label">処理済み</div>
+                        <div class="stat-label">総処理数</div>
                     </div>
                     <div class="stat-item">
                         <div id="successfulWebhooks" class="stat-number">0</div>
                         <div class="stat-label">成功</div>
                     </div>
                     <div class="stat-item">
+                        <div id="todayProcessed" class="stat-number">0</div>
+                        <div class="stat-label">今日</div>
+                    </div>
+                    <div class="stat-item">
                         <div id="failedWebhooks" class="stat-number">0</div>
                         <div class="stat-label">失敗</div>
                     </div>
+                </div>
+                <div class="controls">
+                    <button id="refreshStatsBtn" class="btn btn-secondary">更新</button>
+                    <button id="clearDataBtn" class="btn btn-danger">データクリア</button>
                 </div>
             </div>
             
             <!-- Configuration Card -->
             <div class="card">
                 <h3>⚙️ 設定</h3>
-                <div class="form-group">
-                    <label>チェック間隔 (秒)</label>
-                    <input type="number" id="checkInterval" class="form-control" value="20" min="5" max="3600">
-                </div>
-                <div class="form-group">
-                    <label>最大メール数</label>
-                    <input type="number" id="maxEmails" class="form-control" value="10" min="1" max="100">
-                </div>
-                <div class="form-group">
-                    <label>Webhook URL</label>
-                    <input type="url" id="webhookUrl" class="form-control" placeholder="https://...">
+                <div class="config-section">
+                    <div class="form-group">
+                        <label>チェック間隔 (秒)</label>
+                        <input type="number" id="checkInterval" class="form-control" value="60" min="30" max="3600" readonly>
+                        <div class="config-note">環境変数 CHECK_INTERVAL_SECONDS で設定</div>
+                    </div>
+                    <div class="form-group">
+                        <label>最大メール数</label>
+                        <input type="number" id="maxEmails" class="form-control" value="10" min="1" max="100" readonly>
+                        <div class="config-note">環境変数 MAX_EMAILS_PER_CHECK で設定</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Webhook URL</label>
+                        <input type="text" id="webhookUrl" class="form-control" placeholder="環境変数から取得..." readonly>
+                        <div class="config-note">環境変数 WEBHOOK_URL で設定</div>
+                    </div>
                 </div>
                 <div class="controls">
-                    <button id="saveConfigBtn" class="btn btn-primary">設定保存</button>
-                    <button id="testConnectionBtn" class="btn btn-secondary">接続テスト</button>
+                    <button id="testConnectionBtn" class="btn btn-primary">接続テスト</button>
                 </div>
             </div>
         </div>
@@ -377,8 +417,6 @@
                 </div>
                 <div class="controls">
                     <button id="refreshEmailsBtn" class="btn btn-secondary">更新</button>
-                    <button id="clearProcessedBtn" class="btn btn-danger">履歴クリア</button>
-                    <button id="exportDataBtn" class="btn btn-primary">データ出力</button>
                 </div>
             </div>
             
@@ -407,15 +445,6 @@
         let isProcessorRunning = false;
         let isProcessorPaused = false;
         
-        // DOM elements
-        const statusIndicator = document.getElementById('statusIndicator');
-        const statusText = document.getElementById('statusText');
-        const startBtn = document.getElementById('startBtn');
-        const pauseBtn = document.getElementById('pauseBtn');
-        const stopBtn = document.getElementById('stopBtn');
-        const runOnceBtn = document.getElementById('runOnceBtn');
-        const lastUpdate = document.getElementById('lastUpdate');
-        
         // Initialize dashboard
         document.addEventListener('DOMContentLoaded', function() {
             loadConfiguration();
@@ -424,14 +453,29 @@
             updateRecentEmails();
             updateLogs();
             
-            // Start periodic updates
+            // Start periodic updates every 5 seconds
             updateInterval = setInterval(() => {
                 updateStatus();
                 updateStats();
                 updateRecentEmails();
                 updateLogs();
             }, 5000);
+            
+            // Set up event handlers
+            setupEventHandlers();
         });
+        
+        function setupEventHandlers() {
+            document.getElementById('startBtn').addEventListener('click', handleStart);
+            document.getElementById('pauseBtn').addEventListener('click', handlePause);
+            document.getElementById('stopBtn').addEventListener('click', handleStop);
+            document.getElementById('runOnceBtn').addEventListener('click', handleRunOnce);
+            document.getElementById('testConnectionBtn').addEventListener('click', handleTestConnection);
+            document.getElementById('refreshStatsBtn').addEventListener('click', updateStats);
+            document.getElementById('refreshEmailsBtn').addEventListener('click', updateRecentEmails);
+            document.getElementById('refreshLogsBtn').addEventListener('click', updateLogs);
+            document.getElementById('clearDataBtn').addEventListener('click', handleClearData);
+        }
         
         // API functions
         async function apiCall(endpoint, method = 'GET', data = null) {
@@ -448,7 +492,13 @@
                 }
                 
                 const response = await fetch(`/api/${endpoint}`, options);
-                return await response.json();
+                const result = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(result.message || `HTTP ${response.status}`);
+                }
+                
+                return result;
             } catch (error) {
                 console.error(`API call failed: ${endpoint}`, error);
                 showNotification(`API エラー: ${error.message}`, 'error');
@@ -465,30 +515,36 @@
             isProcessorPaused = status.paused;
             
             // Update UI
+            const indicator = document.getElementById('statusIndicator');
+            const text = document.getElementById('statusText');
+            const startBtn = document.getElementById('startBtn');
+            const pauseBtn = document.getElementById('pauseBtn');
+            const stopBtn = document.getElementById('stopBtn');
+            
             if (isProcessorRunning && !isProcessorPaused) {
-                statusIndicator.className = 'status-indicator status-running';
-                statusIndicator.textContent = '実行中';
-                statusText.textContent = 'プロセッサは実行中です';
+                indicator.className = 'status-indicator status-running';
+                indicator.textContent = '実行中';
+                text.textContent = 'プロセッサは実行中です';
                 startBtn.disabled = true;
                 pauseBtn.disabled = false;
                 stopBtn.disabled = false;
             } else if (isProcessorRunning && isProcessorPaused) {
-                statusIndicator.className = 'status-indicator status-paused';
-                statusIndicator.textContent = '一時停止';
-                statusText.textContent = 'プロセッサは一時停止中です';
+                indicator.className = 'status-indicator status-paused';
+                indicator.textContent = '一時停止';
+                text.textContent = 'プロセッサは一時停止中です';
                 startBtn.disabled = false;
                 pauseBtn.disabled = true;
                 stopBtn.disabled = false;
             } else {
-                statusIndicator.className = 'status-indicator status-stopped';
-                statusIndicator.textContent = '停止';
-                statusText.textContent = 'プロセッサは停止中です';
+                indicator.className = 'status-indicator status-stopped';
+                indicator.textContent = '停止中';
+                text.textContent = 'プロセッサは停止中です';
                 startBtn.disabled = false;
                 pauseBtn.disabled = true;
                 stopBtn.disabled = true;
             }
             
-            lastUpdate.textContent = new Date().toLocaleString('ja-JP');
+            document.getElementById('lastUpdate').textContent = new Date().toLocaleString('ja-JP');
         }
         
         async function updateStats() {
@@ -498,22 +554,23 @@
             document.getElementById('totalProcessed').textContent = stats.total_processed || 0;
             document.getElementById('successfulWebhooks').textContent = stats.successful_webhooks || 0;
             document.getElementById('failedWebhooks').textContent = stats.failed_webhooks || 0;
+            document.getElementById('todayProcessed').textContent = stats.today_processed || 0;
         }
         
         async function updateRecentEmails() {
-            const result = await apiCall('recent-emails');
-            if (!result) return;
+            const emails = await apiCall('recent-emails');
+            if (!emails) return;
             
             const container = document.getElementById('recentEmails');
             
-            if (result.emails && result.emails.length > 0) {
-                container.innerHTML = result.emails.map(email => `
+            if (emails.length > 0) {
+                container.innerHTML = emails.map(email => `
                     <div class="email-item">
-                        <div class="email-subject">${escapeHtml(email.subject)}</div>
+                        <div class="email-subject">${escapeHtml(email.subject || 'No Subject')}</div>
                         <div class="email-meta">
-                            送信者: ${escapeHtml(email.sender)} | 
-                            日時: ${email.date} | 
-                            処理日時: ${email.processed_at}
+                            送信者: ${escapeHtml(email.sender || 'Unknown')} | 
+                            処理日時: ${email.processed_date || 'Unknown'}
+                            ${email.webhook_sent ? ' | ✓ Webhook送信済み' : ' | ✗ Webhook失敗'}
                         </div>
                     </div>
                 `).join('');
@@ -529,7 +586,7 @@
             const container = document.getElementById('systemLogs');
             
             if (result.logs && result.logs.length > 0) {
-                container.innerHTML = result.logs.map(log => 
+                container.innerHTML = result.logs.slice(-50).map(log => 
                     `<div class="log-entry">${escapeHtml(log)}</div>`
                 ).join('');
                 container.scrollTop = container.scrollHeight;
@@ -539,42 +596,45 @@
         }
         
         async function loadConfiguration() {
-            const config = await apiCall('config');
-            if (!config) return;
+            const status = await apiCall('status');
+            if (!status || !status.config) return;
             
-            document.getElementById('checkInterval').value = config.check_interval || 20;
+            const config = status.config;
+            document.getElementById('checkInterval').value = config.check_interval || 60;
             document.getElementById('maxEmails').value = config.max_emails || 10;
-            document.getElementById('webhookUrl').value = config.webhook_url || '';
+            document.getElementById('webhookUrl').value = config.webhook_url ? 
+                config.webhook_url.substring(0, 50) + '...' : '未設定';
         }
         
         // Event handlers
-        startBtn.addEventListener('click', async () => {
+        async function handleStart() {
             const result = await apiCall('start', 'POST');
             if (result) {
                 showNotification(result.message, result.success ? 'success' : 'error');
                 updateStatus();
             }
-        });
+        }
         
-        pauseBtn.addEventListener('click', async () => {
+        async function handlePause() {
             const result = await apiCall('pause', 'POST');
             if (result) {
                 showNotification(result.message, result.success ? 'success' : 'error');
                 updateStatus();
             }
-        });
+        }
         
-        stopBtn.addEventListener('click', async () => {
+        async function handleStop() {
             const result = await apiCall('stop', 'POST');
             if (result) {
                 showNotification(result.message, result.success ? 'success' : 'error');
                 updateStatus();
             }
-        });
+        }
         
-        runOnceBtn.addEventListener('click', async () => {
-            runOnceBtn.disabled = true;
-            runOnceBtn.textContent = '実行中...';
+        async function handleRunOnce() {
+            const btn = document.getElementById('runOnceBtn');
+            btn.disabled = true;
+            btn.textContent = '実行中...';
             
             const result = await apiCall('run-once', 'POST');
             if (result) {
@@ -583,65 +643,35 @@
                 updateRecentEmails();
             }
             
-            runOnceBtn.disabled = false;
-            runOnceBtn.textContent = '一回実行';
-        });
+            btn.disabled = false;
+            btn.textContent = '一回実行';
+        }
         
-        document.getElementById('saveConfigBtn').addEventListener('click', async () => {
-            const config = {
-                check_interval: parseInt(document.getElementById('checkInterval').value),
-                max_emails: parseInt(document.getElementById('maxEmails').value),
-                webhook_url: document.getElementById('webhookUrl').value
-            };
-            
-            const result = await apiCall('config', 'POST', config);
-            if (result) {
-                showNotification(result.message, result.success ? 'success' : 'error');
-            }
-        });
-        
-        document.getElementById('testConnectionBtn').addEventListener('click', async () => {
+        async function handleTestConnection() {
             const btn = document.getElementById('testConnectionBtn');
             btn.disabled = true;
             btn.textContent = 'テスト中...';
             
             const result = await apiCall('test-connection', 'POST');
             if (result) {
-                showNotification(result.message, result.success ? 'success' : 'error');
+                const success = result.gmail_connection && result.webhook_connection;
+                showNotification(result.message, success ? 'success' : 'warning');
             }
             
             btn.disabled = false;
             btn.textContent = '接続テスト';
-        });
+        }
         
-        document.getElementById('refreshEmailsBtn').addEventListener('click', updateRecentEmails);
-        document.getElementById('refreshLogsBtn').addEventListener('click', updateLogs);
-        
-        document.getElementById('clearProcessedBtn').addEventListener('click', async () => {
-            if (confirm('処理済みメールの履歴をクリアしますか？')) {
+        async function handleClearData() {
+            if (confirm('すべての処理済みデータを削除しますか？この操作は取り消せません。')) {
                 const result = await apiCall('clear-processed', 'POST');
                 if (result) {
                     showNotification(result.message, result.success ? 'success' : 'error');
-                    updateRecentEmails();
                     updateStats();
+                    updateRecentEmails();
                 }
             }
-        });
-        
-        document.getElementById('exportDataBtn').addEventListener('click', async () => {
-            const result = await apiCall('export-data');
-            if (result) {
-                const dataStr = JSON.stringify(result, null, 2);
-                const dataBlob = new Blob([dataStr], {type: 'application/json'});
-                const url = URL.createObjectURL(dataBlob);
-                const link = document.createElement('a');
-                link.href = url;
-                link.download = `email_processor_data_${new Date().toISOString().split('T')[0]}.json`;
-                link.click();
-                URL.revokeObjectURL(url);
-                showNotification('データをエクスポートしました', 'success');
-            }
-        });
+        }
         
         // Utility functions
         function showNotification(message, type) {
@@ -652,16 +682,17 @@
             
             setTimeout(() => {
                 notification.classList.remove('show');
-            }, 3000);
+            }, 4000);
         }
         
         function escapeHtml(text) {
+            if (!text) return '';
             const div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
         }
         
-        // Cleanup on page unload
+        // Cleanup
         window.addEventListener('beforeunload', () => {
             if (updateInterval) {
                 clearInterval(updateInterval);
