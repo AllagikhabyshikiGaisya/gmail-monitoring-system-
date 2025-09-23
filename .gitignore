@@ -159,3 +159,14 @@ tmp/
 # Data directories
 data/
 logs/
+
+# filepath: c:\Email Processing System\.gitignore
+# ...existing code...
+
+# Credentials and tokens - NO EXCEPTIONS
+credentials.json
+token.json
+*.key
+*.pem
+*.p12
+*.pfx
