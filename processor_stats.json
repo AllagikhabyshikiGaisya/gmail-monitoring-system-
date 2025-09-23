@@ -1,15 +1,22 @@
 {
-  "total_processed": 25,
-  "successful_webhooks": 25,
+  "total_processed": 58,
+  "successful_webhooks": 58,
   "failed_webhooks": 0,
-  "last_run": "2025-09-22T16:21:09.601969",
+  "last_run": "2025-09-23T13:51:22.458620",
   "daily_stats": {
     "2025-09-22": {
-      "processed": 25,
-      "successful": 25,
+      "processed": 34,
+      "successful": 34,
       "failed": 0,
       "first_run": "2025-09-22T14:09:11.120735",
-      "last_run": "2025-09-22T16:21:09.601993"
+      "last_run": "2025-09-22T17:23:27.243253"
+    },
+    "2025-09-23": {
+      "processed": 24,
+      "successful": 24,
+      "failed": 0,
+      "first_run": "2025-09-23T08:55:42.170435",
+      "last_run": "2025-09-23T13:51:22.458632"
     }
   },
   "created_at": "2025-09-22T14:07:15.808189"

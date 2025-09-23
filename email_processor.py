@@ -19,6 +19,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import html
 import unicodedata
+import threading
 
 # Configure logging
 logging.basicConfig(
@@ -348,7 +349,7 @@ class UniversalJSONProcessor:
 
 
 class GmailAPIProcessor:
-    """Enhanced Gmail API processor with improved Japanese text handling"""
+    """Enhanced Gmail API processor with improved Japanese text handling and persistent authentication"""
     
     SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
     
@@ -367,6 +368,7 @@ class GmailAPIProcessor:
         self.service = None
         self.processed_emails = set()
         self.universal_json = UniversalJSONProcessor()
+        self._auth_lock = threading.Lock()
         
         # Load processed emails from file if exists
         self.load_processed_emails()
@@ -386,59 +388,98 @@ class GmailAPIProcessor:
         """Save processed email IDs to file"""
         try:
             with open('processed_emails.json', 'w', encoding='utf-8') as f:
-                json.dump({'processed_ids': list(self.processed_emails)}, f, ensure_ascii=False, indent=2)
+                json.dump({
+                    'processed_ids': list(self.processed_emails),
+                    'last_updated': datetime.now().isoformat()
+                }, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"Error saving processed emails: {e}")
     
     def authenticate(self) -> bool:
-        """Authenticate and build Gmail service using existing credentials"""
-        try:
-            creds = None
-            
-            # Load existing token
-            if os.path.exists(self.token_path):
-                try:
-                    with open(self.token_path, 'rb') as token:
-                        creds = pickle.load(token)
-                except Exception as e:
-                    logger.warning(f"Could not load existing token: {e}")
-                    if os.path.exists(self.token_path):
-                        os.remove(self.token_path)
-            
-            # If there are no valid credentials, run the OAuth flow
-            if not creds or not creds.valid:
-                if creds and creds.expired and creds.refresh_token:
+        """Authenticate and build Gmail service using existing credentials with persistent token handling"""
+        with self._auth_lock:
+            try:
+                creds = None
+                
+                # Load existing token
+                if os.path.exists(self.token_path):
                     try:
+                        with open(self.token_path, 'rb') as token:
+                            creds = pickle.load(token)
+                        logger.info("Loaded existing credentials from token file")
+                    except Exception as e:
+                        logger.warning(f"Could not load existing token: {e}")
+                        if os.path.exists(self.token_path):
+                            try:
+                                os.remove(self.token_path)
+                                logger.info("Removed corrupted token file")
+                            except:
+                                pass
+                
+                # Check if credentials are valid
+                if creds and creds.valid:
+                    logger.info("Using valid existing credentials")
+                elif creds and creds.expired and creds.refresh_token:
+                    try:
+                        logger.info("Refreshing expired credentials")
                         creds.refresh(Request())
+                        logger.info("Successfully refreshed credentials")
+                        
+                        # Save refreshed credentials
+                        with open(self.token_path, 'wb') as token:
+                            pickle.dump(creds, token)
+                            
                     except Exception as e:
                         logger.warning(f"Token refresh failed: {e}")
                         creds = None
                 
+                # If no valid credentials, run OAuth flow
                 if not creds:
                     if not os.path.exists(self.credentials_path):
                         logger.error(f"Credentials file not found: {self.credentials_path}")
                         return False
                     
+                    logger.info("Running OAuth flow for new credentials")
                     flow = InstalledAppFlow.from_client_secrets_file(
                         self.credentials_path, self.SCOPES)
-                    creds = flow.run_local_server(port=0)
+                    
+                    # Try to run local server, fallback to console if needed
+                    try:
+                        creds = flow.run_local_server(port=0, open_browser=True)
+                    except Exception as e:
+                        logger.warning(f"Could not run local server: {e}")
+                        logger.info("Please complete authentication manually:")
+                        creds = flow.run_console()
+                    
+                    logger.info("OAuth flow completed successfully")
                 
-                # Save the credentials for the next run
-                with open(self.token_path, 'wb') as token:
-                    pickle.dump(creds, token)
-            
-            # Build the Gmail service
-            self.service = build('gmail', 'v1', credentials=creds)
-            logger.info("Gmail API authentication successful")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Authentication failed: {e}")
-            return False
+                # Save the credentials for future use
+                try:
+                    with open(self.token_path, 'wb') as token:
+                        pickle.dump(creds, token)
+                    logger.info("Saved credentials to token file")
+                except Exception as e:
+                    logger.error(f"Could not save credentials: {e}")
+                
+                # Build the Gmail service
+                self.service = build('gmail', 'v1', credentials=creds)
+                
+                # Test the service with a simple call
+                try:
+                    profile = self.service.users().getProfile(userId='me').execute()
+                    logger.info(f"Gmail API authentication successful for {profile.get('emailAddress', 'unknown')}")
+                    return True
+                except Exception as e:
+                    logger.error(f"Gmail API test call failed: {e}")
+                    return False
+                
+            except Exception as e:
+                logger.error(f"Authentication failed: {e}")
+                return False
     
     def get_latest_emails(self, max_results: int = 10) -> List[Dict]:
         """
-        Get latest emails from inbox
+        Get latest emails from inbox with improved error handling
         
         Args:
             max_results: Maximum number of emails to fetch
@@ -452,11 +493,25 @@ class GmailAPIProcessor:
                     return []
             
             # Get list of emails (latest first)
-            results = self.service.users().messages().list(
-                userId='me',
-                labelIds=['INBOX'],
-                maxResults=max_results
-            ).execute()
+            try:
+                results = self.service.users().messages().list(
+                    userId='me',
+                    labelIds=['INBOX'],
+                    maxResults=max_results
+                ).execute()
+            except HttpError as e:
+                if e.resp.status == 401:
+                    logger.warning("Authentication expired, re-authenticating...")
+                    if self.authenticate():
+                        results = self.service.users().messages().list(
+                            userId='me',
+                            labelIds=['INBOX'],
+                            maxResults=max_results
+                        ).execute()
+                    else:
+                        return []
+                else:
+                    raise
             
             messages = results.get('messages', [])
             
@@ -794,18 +849,23 @@ class GmailAPIProcessor:
         # Remove common unwanted suffixes/prefixes
         unwanted_patterns = [
             r'^\s*[：:]\s*',  # Leading colon
-            r'\s*[：:]\s*',  # Trailing colon
+            r'\s*[：:]\s*'
+            ,  # Trailing colon
             r'^.*?[：:]\s*',  # Everything before colon (only if there's text after)
-            r'\s*様\s*',    # Honorific suffix
-            r'\s*さん\s*',   # Honorific suffix
-            r'\s*殿\s*',     # Honorific suffix
+            r'\s*様\s*'
+            ,    # Honorific suffix
+            r'\s*さん\s*'
+            ,   # Honorific suffix
+            r'\s*殿\s*'
+            ,     # Honorific suffix
         ]
         
         for pattern in unwanted_patterns:
             value = re.sub(pattern, '', value).strip()
         
         # Return empty string if value is too short or contains only special characters
-        if len(value) < 1 or re.match(r'^[^\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]+', value):
+        if len(value) < 1 or re.match(r'^[^\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]+$'
+            , value):
             return ""
         
         return value
@@ -916,7 +976,7 @@ class GmailAPIProcessor:
                     timeout=30
                 )
                 
-                if response.status_code in [200, 201, 204]:
+                if response.status_code in [200, 201, 202, 204]:
                     logger.info(f"Data successfully sent to webhook (attempt {attempt + 1})")
                     return True
                 else:
@@ -940,7 +1000,8 @@ class GmailAPIProcessor:
         """Save processed data to local file for debugging and backup"""
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"processed_data_{timestamp}.json"
+            email_id = email_data.get('id', 'unknown')[:8]  # First 8 chars of ID
+            filename = f"processed_data_{timestamp}_{email_id}.json"
             
             save_data = {
                 'email_metadata': {
@@ -959,8 +1020,40 @@ class GmailAPIProcessor:
                 json.dump(save_data, f, ensure_ascii=False, indent=2)
             
             logger.info(f"Processed data saved to: {filename}")
+            
+            # Clean up old files (keep only last 50)
+            self._cleanup_old_files()
+            
         except Exception as e:
             logger.error(f"Error saving processed data: {e}")
+    
+    def _cleanup_old_files(self):
+        """Clean up old processed data files to prevent disk space issues"""
+        try:
+            # Get all processed data files
+            files = []
+            for filename in os.listdir('.'):
+                if filename.startswith('processed_data_') and filename.endswith('.json'):
+                    try:
+                        stat = os.stat(filename)
+                        files.append((filename, stat.st_mtime))
+                    except OSError:
+                        pass
+            
+            # Sort by modification time (newest first)
+            files.sort(key=lambda x: x[1], reverse=True)
+            
+            # Keep only the 50 most recent files
+            if len(files) > 50:
+                for filename, _ in files[50:]:
+                    try:
+                        os.remove(filename)
+                        logger.info(f"Removed old processed data file: {filename}")
+                    except OSError as e:
+                        logger.warning(f"Could not remove old file {filename}: {e}")
+                        
+        except Exception as e:
+            logger.warning(f"Error cleaning up old files: {e}")
     
     def process_emails(self) -> int:
         """
@@ -1013,7 +1106,9 @@ class GmailAPIProcessor:
                     self.save_processed_data(email_data, universal_data)
                     
                     # Send to webhook
-                    if self.send_to_webhook(universal_data):
+                    webhook_success = self.send_to_webhook(universal_data)
+                    
+                    if webhook_success:
                         logger.info(f"Successfully processed email {email_id}")
                         processed_count += 1
                     else:
@@ -1082,79 +1177,108 @@ class GmailAPIProcessor:
 
 
 class EmailProcessorStats:
-    """Statistics and monitoring for email processor"""
+    """Statistics and monitoring for email processor with better persistence"""
     
     def __init__(self):
         self.stats_file = 'processor_stats.json'
         self.stats = self.load_stats()
+        self._lock = threading.Lock()
     
     def load_stats(self) -> Dict:
         """Load processing statistics"""
         try:
             if os.path.exists(self.stats_file):
                 with open(self.stats_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            return {
-                'total_processed': 0,
-                'successful_webhooks': 0,
-                'failed_webhooks': 0,
-                'last_run': None,
-                'daily_stats': {},
-                'created_at': datetime.now().isoformat()
-            }
+                    stats = json.load(f)
+                    # Ensure all required fields exist
+                    default_stats = {
+                        'total_processed': 0,
+                        'successful_webhooks': 0,
+                        'failed_webhooks': 0,
+                        'last_run': None,
+                        'daily_stats': {},
+                        'created_at': datetime.now().isoformat(),
+                        'last_updated': datetime.now().isoformat()
+                    }
+                    
+                    for key, default_value in default_stats.items():
+                        if key not in stats:
+                            stats[key] = default_value
+                    
+                    return stats
         except Exception as e:
             logger.error(f"Error loading stats: {e}")
-            return {}
+        
+        # Return default stats if loading fails
+        return {
+            'total_processed': 0,
+            'successful_webhooks': 0,
+            'failed_webhooks': 0,
+            'last_run': None,
+            'daily_stats': {},
+            'created_at': datetime.now().isoformat(),
+            'last_updated': datetime.now().isoformat()
+        }
     
     def save_stats(self):
-        """Save statistics to file"""
-        try:
-            with open(self.stats_file, 'w', encoding='utf-8') as f:
-                json.dump(self.stats, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"Error saving stats: {e}")
+        """Save statistics to file with thread safety"""
+        with self._lock:
+            try:
+                self.stats['last_updated'] = datetime.now().isoformat()
+                with open(self.stats_file, 'w', encoding='utf-8') as f:
+                    json.dump(self.stats, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                logger.error(f"Error saving stats: {e}")
     
     def update_stats(self, processed: int, successful: int):
-        """Update processing statistics"""
-        today = datetime.now().strftime('%Y-%m-%d')
-        
-        self.stats['total_processed'] += processed
-        self.stats['successful_webhooks'] += successful
-        self.stats['failed_webhooks'] += (processed - successful)
-        self.stats['last_run'] = datetime.now().isoformat()
-        
-        if today not in self.stats['daily_stats']:
-            self.stats['daily_stats'][today] = {
-                'processed': 0,
-                'successful': 0,
-                'failed': 0,
-                'first_run': datetime.now().isoformat()
-            }
-        
-        self.stats['daily_stats'][today]['processed'] += processed
-        self.stats['daily_stats'][today]['successful'] += successful
-        self.stats['daily_stats'][today]['failed'] += (processed - successful)
-        self.stats['daily_stats'][today]['last_run'] = datetime.now().isoformat()
-        
-        self.save_stats()
-        logger.info(f"Stats updated: Total processed={self.stats['total_processed']}, Today processed={self.stats['daily_stats'][today]['processed']}")
+        """Update processing statistics with thread safety"""
+        with self._lock:
+            today = datetime.now().strftime('%Y-%m-%d')
+            
+            self.stats['total_processed'] += processed
+            self.stats['successful_webhooks'] += successful
+            self.stats['failed_webhooks'] += (processed - successful)
+            self.stats['last_run'] = datetime.now().isoformat()
+            
+            if today not in self.stats['daily_stats']:
+                self.stats['daily_stats'][today] = {
+                    'processed': 0,
+                    'successful': 0,
+                    'failed': 0,
+                    'first_run': datetime.now().isoformat()
+                }
+            
+            self.stats['daily_stats'][today]['processed'] += processed
+            self.stats['daily_stats'][today]['successful'] += successful
+            self.stats['daily_stats'][today]['failed'] += (processed - successful)
+            self.stats['daily_stats'][today]['last_run'] = datetime.now().isoformat()
+            
+            # Clean up old daily stats (keep only last 30 days)
+            cutoff_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+            old_dates = [date for date in self.stats['daily_stats'].keys() if date < cutoff_date]
+            for old_date in old_dates:
+                del self.stats['daily_stats'][old_date]
+            
+            self.save_stats()
+            logger.info(f"Stats updated: Total processed={self.stats['total_processed']}, Today processed={self.stats['daily_stats'][today]['processed']}")
     
     def get_stats(self) -> Dict:
         """Get current statistics"""
-        return self.stats
+        with self._lock:
+            return self.stats.copy()
     
     def get_daily_stats(self, days: int = 7) -> Dict:
         """Get statistics for recent days"""
-        daily_stats = {}
-        for i in range(days):
-            date = datetime.now().date() - timedelta(days=i)
-            date_str = date.strftime('%Y-%m-%d')
-            daily_stats[date_str] = self.stats['daily_stats'].get(date_str, {
-                'processed': 0,
-                'successful': 0,
-                'failed': 0
-            })
-        return daily_stats
+        with self._lock:
+            daily_stats = {}
+            for i in range(days):
+                date = (datetime.now().date() - timedelta(days=i)).strftime('%Y-%m-%d')
+                daily_stats[date] = self.stats['daily_stats'].get(date, {
+                    'processed': 0,
+                    'successful': 0,
+                    'failed': 0
+                })
+            return daily_stats
 
 
 def main():
