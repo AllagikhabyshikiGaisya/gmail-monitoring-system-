@@ -164,7 +164,7 @@ logs/
 # ...existing code...
 
 # Credentials and tokens - NO EXCEPTIONS
-
+credentials.json
 token.json
 *.key
 *.pem

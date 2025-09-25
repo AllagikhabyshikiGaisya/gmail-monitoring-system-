@@ -10,8 +10,6 @@ import logging
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 import pickle
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -22,6 +20,7 @@ import html
 import unicodedata
 import threading
 from pathlib import Path
+import tempfile
 
 # Load environment variables from .env file if available
 try:
@@ -35,8 +34,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('email_processor.log'),
-        logging.StreamHandler()
+        logging.StreamHandler()  # Only console logging for Render
     ]
 )
 logger = logging.getLogger(__name__)
@@ -44,8 +42,12 @@ logger = logging.getLogger(__name__)
 class EmailDatabase:
     """SQLite database manager for tracking processed emails"""
     
-    def __init__(self, db_path: str = "processed_emails.db"):
-        self.db_path = db_path
+    def __init__(self, db_path: str = None):
+        # Use /tmp directory for Render (writable filesystem)
+        if db_path is None:
+            self.db_path = os.path.join(tempfile.gettempdir(), "processed_emails.db")
+        else:
+            self.db_path = db_path
         self.init_database()
         
     def init_database(self):
@@ -474,7 +476,7 @@ class UniversalJSONProcessor:
 
 
 class GmailAPIProcessor:
-    """Enhanced Gmail API processor with improved handling and archiving"""
+    """Enhanced Gmail API processor with improved handling for Render deployment"""
     
     SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.modify']
     
@@ -486,10 +488,8 @@ class GmailAPIProcessor:
             webhook_url: Webhook URL to send processed data (can be set via env var)
         """
         # Get configuration from environment variables
-        self.credentials_path = os.getenv('GMAIL_CREDENTIALS_PATH', 'credentials.json')
-        self.token_path = os.getenv('GMAIL_TOKEN_PATH', 'token.json')
         self.webhook_url = webhook_url or os.getenv('WEBHOOK_URL')
-        self.max_emails = int(os.getenv('MAX_EMAILS_PER_CHECK', '10'))
+        self.max_emails = int(os.getenv('MAX_EMAILS_PER_CHECK', '50'))
         self.archive_processed = os.getenv('ARCHIVE_PROCESSED_EMAILS', 'true').lower() == 'true'
         
         # Initialize components
@@ -500,71 +500,122 @@ class GmailAPIProcessor:
         
         logger.info(f"Email processor initialized with webhook: {self.webhook_url}")
         
+    def create_credentials_from_env(self) -> Optional[Credentials]:
+        """Create credentials from environment variables for production deployment"""
+        try:
+            # Get credentials JSON from environment variable
+            creds_json = os.getenv('GMAIL_CREDENTIALS_JSON')
+            refresh_token = os.getenv('GMAIL_REFRESH_TOKEN')
+            
+            if not creds_json or not refresh_token:
+                logger.error("Missing GMAIL_CREDENTIALS_JSON or GMAIL_REFRESH_TOKEN environment variables")
+                return None
+            
+            # Parse the credentials JSON
+            creds_info = json.loads(creds_json)
+            client_info = creds_info.get('installed', creds_info)
+            
+            # Create credentials object
+            creds = Credentials(
+                token=None,  # Will be refreshed
+                refresh_token=refresh_token,
+                token_uri=client_info['token_uri'],
+                client_id=client_info['client_id'],
+                client_secret=client_info['client_secret'],
+                scopes=self.SCOPES
+            )
+            
+            # Refresh the token
+            creds.refresh(Request())
+            
+            logger.info("Successfully created credentials from environment variables")
+            return creds
+            
+        except Exception as e:
+            logger.error(f"Error creating credentials from environment: {e}")
+            return None
+        
     def authenticate(self) -> bool:
-        """Authenticate and build Gmail service with persistent token handling"""
+        """Authenticate and build Gmail service with environment variable handling for production"""
         with self._auth_lock:
             try:
                 creds = None
                 
-                # Load existing token
-                if os.path.exists(self.token_path):
-                    try:
-                        with open(self.token_path, 'rb') as token:
-                            creds = pickle.load(token)
-                        logger.info("Loaded existing credentials from token file")
-                    except Exception as e:
-                        logger.warning(f"Could not load existing token: {e}")
-                        if os.path.exists(self.token_path):
-                            try:
-                                os.remove(self.token_path)
-                                logger.info("Removed corrupted token file")
-                            except:
-                                pass
+                # For production (Render), use environment variables
+                if os.getenv('GMAIL_CREDENTIALS_JSON') and os.getenv('GMAIL_REFRESH_TOKEN'):
+                    logger.info("Using environment variables for authentication (production mode)")
+                    creds = self.create_credentials_from_env()
                 
-                # Check if credentials are valid
-                if creds and creds.valid:
-                    logger.info("Using valid existing credentials")
-                elif creds and creds.expired and creds.refresh_token:
-                    try:
-                        logger.info("Refreshing expired credentials")
-                        creds.refresh(Request())
-                        logger.info("Successfully refreshed credentials")
-                        
-                        # Save refreshed credentials
-                        with open(self.token_path, 'wb') as token:
-                            pickle.dump(creds, token)
+                # For local development, use files
+                else:
+                    logger.info("Using file-based authentication (development mode)")
+                    credentials_path = os.getenv('GMAIL_CREDENTIALS_PATH', 'credentials.json')
+                    token_path = os.getenv('GMAIL_TOKEN_PATH', 'token.json')
+                    
+                    # Load existing token
+                    if os.path.exists(token_path):
+                        try:
+                            with open(token_path, 'rb') as token:
+                                creds = pickle.load(token)
+                            logger.info("Loaded existing credentials from token file")
+                        except Exception as e:
+                            logger.warning(f"Could not load existing token: {e}")
+                            if os.path.exists(token_path):
+                                try:
+                                    os.remove(token_path)
+                                    logger.info("Removed corrupted token file")
+                                except:
+                                    pass
+                    
+                    # Check if credentials are valid
+                    if creds and creds.valid:
+                        logger.info("Using valid existing credentials")
+                    elif creds and creds.expired and creds.refresh_token:
+                        try:
+                            logger.info("Refreshing expired credentials")
+                            creds.refresh(Request())
+                            logger.info("Successfully refreshed credentials")
                             
-                    except Exception as e:
-                        logger.warning(f"Token refresh failed: {e}")
-                        creds = None
+                            # Save refreshed credentials
+                            with open(token_path, 'wb') as token:
+                                pickle.dump(creds, token)
+                                
+                        except Exception as e:
+                            logger.warning(f"Token refresh failed: {e}")
+                            creds = None
+                    
+                    # If no valid credentials, run OAuth flow
+                    if not creds:
+                        if not os.path.exists(credentials_path):
+                            logger.error(f"Credentials file not found: {credentials_path}")
+                            logger.error("For production deployment, set GMAIL_CREDENTIALS_JSON and GMAIL_REFRESH_TOKEN environment variables")
+                            return False
+                        
+                        logger.info("Running OAuth flow for new credentials")
+                        flow = InstalledAppFlow.from_client_secrets_file(
+                            credentials_path, self.SCOPES)
+                        
+                        # Try to run local server, fallback to console if needed
+                        try:
+                            creds = flow.run_local_server(port=0, open_browser=True)
+                        except Exception as e:
+                            logger.warning(f"Could not run local server: {e}")
+                            logger.info("Please complete authentication manually:")
+                            creds = flow.run_console()
+                        
+                        logger.info("OAuth flow completed successfully")
+                        
+                        # Save the credentials for future use
+                        try:
+                            with open(token_path, 'wb') as token:
+                                pickle.dump(creds, token)
+                            logger.info("Saved credentials to token file")
+                        except Exception as e:
+                            logger.error(f"Could not save credentials: {e}")
                 
-                # If no valid credentials, run OAuth flow
                 if not creds:
-                    if not os.path.exists(self.credentials_path):
-                        logger.error(f"Credentials file not found: {self.credentials_path}")
-                        return False
-                    
-                    logger.info("Running OAuth flow for new credentials")
-                    flow = InstalledAppFlow.from_client_secrets_file(
-                        self.credentials_path, self.SCOPES)
-                    
-                    # Try to run local server, fallback to console if needed
-                    try:
-                        creds = flow.run_local_server(port=0, open_browser=True)
-                    except Exception as e:
-                        logger.warning(f"Could not run local server: {e}")
-                        logger.info("Please complete authentication manually:")
-                        creds = flow.run_console()
-                    
-                    logger.info("OAuth flow completed successfully")
-                
-                # Save the credentials for future use
-                try:
-                    with open(self.token_path, 'wb') as token:
-                        pickle.dump(creds, token)
-                    logger.info("Saved credentials to token file")
-                except Exception as e:
-                    logger.error(f"Could not save credentials: {e}")
+                    logger.error("Failed to obtain valid credentials")
+                    return False
                 
                 # Build the Gmail service
                 self.service = build('gmail', 'v1', credentials=creds)
@@ -919,7 +970,8 @@ class GmailAPIProcessor:
             value = re.sub(pattern, '', value).strip()
         
         # Return empty if too short or only special characters
-        if len(value) < 1 or re.match(r'^[^\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]+$', value):
+        if len(value) < 1 or re.match(r'^[^\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]+$'
+                , value):
             return ""
         
         return value
@@ -1135,37 +1187,6 @@ class GmailAPIProcessor:
                 'error': str(e)
             }
     
-    def run_continuous(self, interval_seconds: int = None):
-        """Run email processing continuously"""
-        if interval_seconds is None:
-            interval_seconds = int(os.getenv('CHECK_INTERVAL_SECONDS', '60'))
-            
-        logger.info(f"Starting continuous email processing (checking every {interval_seconds} seconds)")
-        
-        while True:
-            try:
-                logger.info("=" * 50)
-                logger.info("Checking for new emails...")
-                results = self.process_emails()
-                
-                if results['processed'] > 0:
-                    logger.info(f"✓ Processed {results['processed']} emails, "
-                              f"{results['successful_webhooks']} webhooks successful, "
-                              f"{results['archived']} archived")
-                else:
-                    logger.info("✓ No new emails to process")
-                
-                logger.info(f"Waiting {interval_seconds} seconds until next check...")
-                time.sleep(interval_seconds)
-                
-            except KeyboardInterrupt:
-                logger.info("Email processing stopped by user")
-                break
-            except Exception as e:
-                logger.error(f"Error in continuous processing: {e}")
-                logger.info("Waiting 60 seconds before retrying...")
-                time.sleep(60)
-    
     def run_once(self) -> Dict:
         """Run processing once and return results"""
         logger.info("Running email processing once...")
@@ -1242,8 +1263,33 @@ def main():
                 logger.error(f"Processing failed: {results['error']}")
                 exit(1)
         else:
-            # Run continuously
-            processor.run_continuous(args.interval)
+            # Run continuously - This won't work on Render, only for local testing
+            interval = args.interval or int(os.getenv('CHECK_INTERVAL_SECONDS', '60'))
+            logger.info(f"Starting continuous email processing (checking every {interval} seconds)")
+            
+            while True:
+                try:
+                    logger.info("=" * 50)
+                    logger.info("Checking for new emails...")
+                    results = processor.process_emails()
+                    
+                    if results['processed'] > 0:
+                        logger.info(f"✓ Processed {results['processed']} emails, "
+                                  f"{results['successful_webhooks']} webhooks successful, "
+                                  f"{results['archived']} archived")
+                    else:
+                        logger.info("✓ No new emails to process")
+                    
+                    logger.info(f"Waiting {interval} seconds until next check...")
+                    time.sleep(interval)
+                    
+                except KeyboardInterrupt:
+                    logger.info("Email processing stopped by user")
+                    break
+                except Exception as e:
+                    logger.error(f"Error in continuous processing: {e}")
+                    logger.info("Waiting 60 seconds before retrying...")
+                    time.sleep(60)
             
     except KeyboardInterrupt:
         logger.info("Email processor stopped by user")
