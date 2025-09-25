@@ -450,6 +450,17 @@ class UniversalJSONProcessor:
                 r'(?:ご要望|要望|希望)[：:\s]*([^\n]*?)(?:\n\n|$)',
                 r'その他.*?[：:\s]*([^\n]*?)(?:\n\n|$)'
             ],
+            'inquiry_source': [
+                r'(?:お問い?合わせのきっかけ|きっかけ|ご質問のきっかけ|お申し込みのきっかけ)[：:\s]*([^\n]+?)(?:\n|$)',
+                r'(?:どちらでお知りになりましたか|どちらで知り|どこで知り)[：:\s]*([^\n]+?)(?:\n|$)',
+                r'(?:ご紹介|紹介|媒体|メディア)[：:\s]*([^\n]+?)(?:\n|$)',
+                r'きっかけ[：:\s]*([^\n]+?)(?:\n|$)',
+                r'(?:予約のきっかけ|お問い?合わせのきっかけ|きっかけ|ご質問のきっかけ|お申し込みのきっかけ)[：:\s]*([^\n]+?)(?:\n|$)',
+                r'(?:どちらでお知りになりましたか|どちらで知り|どこで知り)[：:\s]*([^\n]+?)(?:\n|$)',
+                r'(?:ご紹介|紹介|媒体|メディア)[：:\s]*([^\n]+?)(?:\n|$)',
+                r'きっかけ[：:\s]*([^\n]+?)(?:\n|$)',
+                r'([インスタグラム|Instagram|IG|facebook|Facebook|FB|Twitter|YouTube|Google|検索|チラシ|広告|紹介|口コミ])(?:\s|$)',
+            ],
             
             # Property Information Patterns
             'property_name': [
@@ -618,7 +629,28 @@ class GmailAPIProcessor:
         except Exception as e:
             logger.error(f"OAuth flow failed: {e}")
             return None
-        
+
+    def extract_email_address(self, email_string: str) -> str:
+        """Extract clean email address from email string"""
+        if not email_string:
+            return ""
+    
+    # Remove quotes from the beginning and end
+        email_string = email_string.strip('"')
+    
+    # Extract email from "Display Name" <email@domain.com> format
+        email_match = re.search(r'<([^>]+)>', email_string)
+        if email_match:
+            return email_match.group(1).strip()
+    
+    # Check if it's already just an email address
+        email_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', email_string)
+        if email_match:
+            return email_match.group(1).strip()
+    
+    # If no email found, return empty string
+        return ""  
+    
     def authenticate(self) -> bool:
         """Authenticate and build Gmail service"""
         with self._auth_lock:
@@ -754,7 +786,8 @@ class GmailAPIProcessor:
                 value = header['value']
                 
                 if name == 'from':
-                    email_data['sender'] = value
+    # FIXED: Extract clean email address only
+                    email_data['sender'] = self.extract_email_address(value)
                 elif name == 'to':
                     email_data['recipient'] = value
                 elif name == 'subject':
@@ -995,7 +1028,7 @@ class GmailAPIProcessor:
             value = re.sub(pattern, '', value).strip()
         
         # Return empty if too short or only special characters
-        if len(value) < 1 or re.match(r'^[^\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]+$'
+        if len(value) < 1 or re.match(r'^[^\w\  u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]+$'
                     , value):
             return ""
         
@@ -1029,6 +1062,8 @@ class GmailAPIProcessor:
             elif field == 'inquiry_text':
                 universal_data["inquiry_info(お問い合わせ内容)"]["inquiry_text(お問い合わせ内容)"] = value
                 universal_data["customer_info(お客様情報)"][0]["comments(ご意見・ご質問等)"] = value
+            elif field == 'inquiry_source':
+                universal_data["inquiry_info(お問い合わせ内容)"]["inquiry_source(お問い合わせのきっかけ)"] = value
             elif field == 'company_name':
                 universal_data["company_info(会社情報)"]["company_name(会社名)"] = value
                 universal_data["property_info(物件情報)"]["company_name(会社名)"] = value
