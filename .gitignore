@@ -169,4 +169,17 @@ token.json
 *.key
 *.pem
 *.p12
+*.
+
+
+# Sensitive credentials
+[token.json](http://_vscodecontentref_/0)
+credentials.json
+get_refresh_token.py
+*.key
+*.pem
+*.p12
 *.pfx
+
+# Environment files
+.env
