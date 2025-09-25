@@ -2,7 +2,7 @@
 """
 Main Flask Application for Email Processor
 Production-ready version with environment configuration and auto-start
-Updated for Render deployment
+Updated for Render deployment with proper OAuth flow support
 """
 
 import os
@@ -51,6 +51,7 @@ class EmailProcessorService:
         self.should_stop = False
         self.config = self.load_config()
         self.system_logs = []
+        self.authentication_status = None
         
         # Initialize processor on startup if auto_start is enabled
         if self.config.get('auto_start', False):
@@ -83,7 +84,7 @@ class EmailProcessorService:
     def initialize_processor(self) -> bool:
         """Initialize the email processor with current config"""
         try:
-            # Check for required environment variables for production
+            # Check for credentials availability
             has_env_creds = bool(os.getenv('GMAIL_CREDENTIALS_JSON') and os.getenv('GMAIL_REFRESH_TOKEN'))
             has_local_creds = os.path.exists(os.getenv('GMAIL_CREDENTIALS_PATH', 'credentials.json'))
             
@@ -91,33 +92,40 @@ class EmailProcessorService:
                 error_msg = "Gmail credentials not found. For production: set GMAIL_CREDENTIALS_JSON and GMAIL_REFRESH_TOKEN. For local: ensure credentials.json exists."
                 self.log_message(error_msg)
                 logger.error(error_msg)
+                self.authentication_status = "missing_credentials"
                 return False
             
             if not self.config['webhook_url']:
                 self.log_message("No webhook URL configured - webhooks will be skipped")
                 logger.warning("No webhook URL configured - webhooks will be skipped")
             
+            # Initialize processor
             self.processor = GmailAPIProcessor(webhook_url=self.config['webhook_url'])
             
-            # Pre-authenticate to avoid repeated auth prompts
-            if not self.processor.authenticate():
+            # Attempt authentication
+            auth_success = self.processor.authenticate()
+            
+            if auth_success:
+                self.log_message("Email processor initialized and authenticated successfully")
+                logger.info("Email processor initialized and authenticated successfully")
+                self.authentication_status = "authenticated"
+                
+                # Auto-start if configured
+                if self.config.get('auto_start', False):
+                    return self.start_processing()
+                
+                return True
+            else:
                 self.log_message("Failed to authenticate with Gmail API")
                 logger.error("Failed to authenticate with Gmail API")
+                self.authentication_status = "auth_failed"
                 return False
-            
-            self.log_message("Email processor initialized successfully")
-            logger.info("Email processor initialized successfully")
-            
-            # Auto-start if configured
-            if self.config.get('auto_start', False):
-                return self.start_processing()
-            
-            return True
             
         except Exception as e:
             error_msg = f"Error initializing processor: {e}"
             self.log_message(error_msg)
             logger.error(error_msg)
+            self.authentication_status = "initialization_error"
             return False
     
     def start_processing(self) -> bool:
@@ -130,8 +138,13 @@ class EmailProcessorService:
                 logger.warning("Processor is already running")
                 return False
         
-        if not self.processor and not self.initialize_processor():
-            return False
+        if not self.processor:
+            if not self.initialize_processor():
+                return False
+        elif self.authentication_status != "authenticated":
+            if not self.processor.authenticate():
+                self.log_message("Authentication required before starting")
+                return False
         
         self.is_running = True
         self.is_paused = False
@@ -185,8 +198,12 @@ class EmailProcessorService:
     
     def run_once(self) -> Dict:
         """Run email processing once and return results"""
-        if not self.processor and not self.initialize_processor():
-            return {'success': False, 'message': 'Failed to initialize processor', 'processed': 0}
+        if not self.processor:
+            if not self.initialize_processor():
+                return {'success': False, 'message': 'Failed to initialize processor', 'processed': 0}
+        elif self.authentication_status != "authenticated":
+            if not self.processor.authenticate():
+                return {'success': False, 'message': 'Authentication failed', 'processed': 0}
         
         try:
             self.log_message("Running one-time email processing...")
@@ -251,6 +268,8 @@ class EmailProcessorService:
             'running': self.is_running,
             'paused': self.is_paused,
             'initialized': self.processor is not None,
+            'authenticated': self.authentication_status == "authenticated",
+            'authentication_status': self.authentication_status,
             'config': self.config
         }
     
@@ -297,11 +316,18 @@ class EmailProcessorService:
         }
         
         try:
-            # Test Gmail connection
+            # Initialize processor if needed
             if not self.processor:
                 if not self.initialize_processor():
                     results['message'] = 'Failed to initialize Gmail processor'
                     self.log_message('Connection test failed: Unable to initialize processor')
+                    return results
+            
+            # Test Gmail connection
+            if self.authentication_status != "authenticated":
+                if not self.processor.authenticate():
+                    results['message'] = 'Gmail authentication failed'
+                    self.log_message('Connection test failed: Gmail authentication failed')
                     return results
             
             # Try to get email list (minimal call)
@@ -341,6 +367,33 @@ class EmailProcessorService:
             self.log_message(f'Connection test failed: {str(e)}')
         
         return results
+    
+    def setup_oauth(self) -> Dict:
+        """Set up OAuth credentials manually"""
+        try:
+            if not self.processor:
+                self.processor = GmailAPIProcessor(webhook_url=self.config['webhook_url'])
+            
+            self.log_message("Starting OAuth setup...")
+            
+            # Try to authenticate (this will trigger OAuth flow if needed)
+            success = self.processor.authenticate()
+            
+            if success:
+                self.authentication_status = "authenticated"
+                message = "OAuth setup completed successfully"
+                self.log_message(message)
+                return {'success': True, 'message': message}
+            else:
+                self.authentication_status = "auth_failed"
+                message = "OAuth setup failed"
+                self.log_message(message)
+                return {'success': False, 'message': message}
+                
+        except Exception as e:
+            error_msg = f"Error during OAuth setup: {e}"
+            self.log_message(error_msg)
+            return {'success': False, 'message': error_msg}
     
     def get_system_logs(self) -> List[str]:
         """Get system logs"""
@@ -452,6 +505,10 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         
         .status-paused {
             background: linear-gradient(45deg, #ff9800, #f57c00);
+        }
+        
+        .status-auth-failed {
+            background: linear-gradient(45deg, #e91e63, #c2185b);
         }
         
         @keyframes pulse {
@@ -663,6 +720,31 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             font-style: italic;
         }
         
+        .auth-status {
+            padding: 10px;
+            margin-bottom: 15px;
+            border-radius: 8px;
+            font-weight: 600;
+        }
+        
+        .auth-status.authenticated {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .auth-status.failed {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .auth-status.missing {
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+        }
+        
         @media (max-width: 768px) {
             .container {
                 padding: 10px;
@@ -691,13 +773,14 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
     <div class="container">
         <div class="header">
             <h1>📧 Email Processor Dashboard</h1>
-            <p>Gmail監視・データ抽出・Webhook送信システム v2.0</p>
+            <p>Gmail監視・データ抽出・Webhook送信システム v2.1</p>
         </div>
         
         <div class="dashboard-grid">
             <!-- Status Card -->
             <div class="card status-card">
                 <h3>システム状態</h3>
+                <div id="authStatus" class="auth-status"></div>
                 <div id="statusIndicator" class="status-indicator status-stopped">
                     停止中
                 </div>
@@ -707,6 +790,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     <button id="pauseBtn" class="btn btn-warning" disabled>一時停止</button>
                     <button id="stopBtn" class="btn btn-danger" disabled>停止</button>
                     <button id="runOnceBtn" class="btn btn-primary">一回実行</button>
+                    <button id="setupOauthBtn" class="btn btn-secondary">OAuth設定</button>
                 </div>
             </div>
             
@@ -801,6 +885,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         let updateInterval;
         let isProcessorRunning = false;
         let isProcessorPaused = false;
+        let authenticationStatus = null;
         
         // Initialize dashboard
         document.addEventListener('DOMContentLoaded', function() {
@@ -828,6 +913,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             document.getElementById('stopBtn').addEventListener('click', handleStop);
             document.getElementById('runOnceBtn').addEventListener('click', handleRunOnce);
             document.getElementById('testConnectionBtn').addEventListener('click', handleTestConnection);
+            document.getElementById('setupOauthBtn').addEventListener('click', handleSetupOauth);
             document.getElementById('refreshStatsBtn').addEventListener('click', updateStats);
             document.getElementById('refreshEmailsBtn').addEventListener('click', updateRecentEmails);
             document.getElementById('refreshLogsBtn').addEventListener('click', updateLogs);
@@ -870,6 +956,23 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             
             isProcessorRunning = status.running;
             isProcessorPaused = status.paused;
+            authenticationStatus = status.authentication_status;
+            
+            // Update authentication status display
+            const authStatusElement = document.getElementById('authStatus');
+            if (status.authenticated) {
+                authStatusElement.className = 'auth-status authenticated';
+                authStatusElement.textContent = '✓ Gmail認証済み';
+            } else if (authenticationStatus === 'missing_credentials') {
+                authStatusElement.className = 'auth-status missing';
+                authStatusElement.textContent = '⚠️ Gmail認証情報が不足しています';
+            } else if (authenticationStatus === 'auth_failed') {
+                authStatusElement.className = 'auth-status failed';
+                authStatusElement.textContent = '✗ Gmail認証に失敗しました';
+            } else {
+                authStatusElement.className = 'auth-status missing';
+                authStatusElement.textContent = '⚠️ Gmail認証が必要です';
+            }
             
             // Update UI
             const indicator = document.getElementById('statusIndicator');
@@ -877,6 +980,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             const startBtn = document.getElementById('startBtn');
             const pauseBtn = document.getElementById('pauseBtn');
             const stopBtn = document.getElementById('stopBtn');
+            const setupOauthBtn = document.getElementById('setupOauthBtn');
             
             if (isProcessorRunning && !isProcessorPaused) {
                 indicator.className = 'status-indicator status-running';
@@ -892,6 +996,13 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 startBtn.disabled = false;
                 pauseBtn.disabled = true;
                 stopBtn.disabled = false;
+            } else if (!status.authenticated) {
+                indicator.className = 'status-indicator status-auth-failed';
+                indicator.textContent = '認証必要';
+                text.textContent = 'Gmail認証が必要です';
+                startBtn.disabled = true;
+                pauseBtn.disabled = true;
+                stopBtn.disabled = true;
             } else {
                 indicator.className = 'status-indicator status-stopped';
                 indicator.textContent = '停止中';
@@ -901,6 +1012,9 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 stopBtn.disabled = true;
             }
             
+            // Enable OAuth setup button if authentication is needed
+            setupOauthBtn.disabled = status.authenticated;
+            
             document.getElementById('lastUpdate').textContent = new Date().toLocaleString('ja-JP');
         }
         
@@ -908,8 +1022,6 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             const stats = await apiCall('stats');
             if (!stats) return;
             
-            document.getElementById('totalProcessed').textContent = stats.total_processed || 0;
-            document.getElementById('successfulWebhooks').textContent = stats.successful_webhooks || 0;
             document.getElementById('totalProcessed').textContent = stats.total_processed || 0;
             document.getElementById('successfulWebhooks').textContent = stats.successful_webhooks || 0;
             document.getElementById('failedWebhooks').textContent = stats.failed_webhooks || 0;
@@ -1004,6 +1116,23 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             
             btn.disabled = false;
             btn.textContent = '一回実行';
+        }
+        
+        async function handleSetupOauth() {
+            const btn = document.getElementById('setupOauthBtn');
+            btn.disabled = true;
+            btn.textContent = '設定中...';
+            
+            showNotification('OAuth設定を開始しています...', 'warning');
+            
+            const result = await apiCall('setup-oauth', 'POST');
+            if (result) {
+                showNotification(result.message, result.success ? 'success' : 'error');
+                updateStatus();
+            }
+            
+            btn.disabled = false;
+            btn.textContent = 'OAuth設定';
         }
         
         async function handleTestConnection() {
@@ -1124,6 +1253,16 @@ def run_once():
         logger.error(f"Error in run-once: {e}")
         return jsonify({'success': False, 'message': f'エラー: {str(e)}'}), 500
 
+@app.route('/api/setup-oauth', methods=['POST'])
+def setup_oauth():
+    """Set up OAuth credentials"""
+    try:
+        result = processor_service.setup_oauth()
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Error in setup-oauth: {e}")
+        return jsonify({'success': False, 'message': f'エラー: {str(e)}'}), 500
+
 @app.route('/api/stats')
 def get_stats():
     """Get processing statistics"""
@@ -1187,6 +1326,7 @@ def health_check():
             'status': 'healthy',
             'initialized': status['initialized'],
             'running': status['running'],
+            'authenticated': status.get('authenticated', False),
             'timestamp': datetime.now().isoformat()
         })
     except Exception as e:

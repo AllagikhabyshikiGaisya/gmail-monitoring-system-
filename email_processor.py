@@ -476,17 +476,12 @@ class UniversalJSONProcessor:
 
 
 class GmailAPIProcessor:
-    """Enhanced Gmail API processor with improved handling for Render deployment"""
+    """Enhanced Gmail API processor with proper OAuth flow"""
     
     SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.modify']
     
     def __init__(self, webhook_url: str = None):
-        """
-        Initialize Gmail API processor
-        
-        Args:
-            webhook_url: Webhook URL to send processed data (can be set via env var)
-        """
+        """Initialize Gmail API processor"""
         # Get configuration from environment variables
         self.webhook_url = webhook_url or os.getenv('WEBHOOK_URL')
         self.max_emails = int(os.getenv('MAX_EMAILS_PER_CHECK', '50'))
@@ -498,27 +493,32 @@ class GmailAPIProcessor:
         self.universal_json = UniversalJSONProcessor()
         self._auth_lock = threading.Lock()
         
-        logger.info(f"Email processor initialized with webhook: {self.webhook_url}")
+        logger.info(f"Email processor initialized with webhook: {bool(self.webhook_url)}")
         
     def create_credentials_from_env(self) -> Optional[Credentials]:
         """Create credentials from environment variables for production deployment"""
         try:
-            # Get credentials JSON from environment variable
+            # Get credentials JSON and refresh token from environment
             creds_json = os.getenv('GMAIL_CREDENTIALS_JSON')
             refresh_token = os.getenv('GMAIL_REFRESH_TOKEN')
             
             if not creds_json or not refresh_token:
-                logger.error("Missing GMAIL_CREDENTIALS_JSON or GMAIL_REFRESH_TOKEN environment variables")
+                logger.info("Missing environment credentials, will try local files")
                 return None
             
             # Parse the credentials JSON
             creds_info = json.loads(creds_json)
             client_info = creds_info.get('installed', creds_info)
             
+            # Validate that refresh_token is actually a token string, not JSON
+            if refresh_token.strip().startswith('{'):
+                logger.error("GMAIL_REFRESH_TOKEN appears to be JSON, but should be just the token string")
+                return None
+            
             # Create credentials object
             creds = Credentials(
                 token=None,  # Will be refreshed
-                refresh_token=refresh_token,
+                refresh_token=refresh_token.strip(),
                 token_uri=client_info['token_uri'],
                 client_id=client_info['client_id'],
                 client_secret=client_info['client_secret'],
@@ -531,87 +531,112 @@ class GmailAPIProcessor:
             logger.info("Successfully created credentials from environment variables")
             return creds
             
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in credentials: {e}")
+            return None
         except Exception as e:
             logger.error(f"Error creating credentials from environment: {e}")
             return None
+    
+    def setup_local_oauth(self) -> Optional[Credentials]:
+        """Set up OAuth flow for local development"""
+        credentials_path = os.getenv('GMAIL_CREDENTIALS_PATH', 'credentials.json')
+        token_path = os.getenv('GMAIL_TOKEN_PATH', 'token.json')
+        
+        # Check if credentials.json exists
+        if not os.path.exists(credentials_path):
+            logger.error(f"Credentials file not found: {credentials_path}")
+            logger.error("Please download credentials.json from Google Cloud Console")
+            logger.error("Visit: https://console.cloud.google.com/apis/credentials")
+            return None
+        
+        creds = None
+        
+        # Load existing token if available
+        if os.path.exists(token_path):
+            try:
+                with open(token_path, 'rb') as token:
+                    creds = pickle.load(token)
+                logger.info("Loaded existing token")
+            except Exception as e:
+                logger.warning(f"Could not load existing token: {e}")
+                # Remove corrupted token file
+                try:
+                    os.remove(token_path)
+                except:
+                    pass
+        
+        # If we have valid credentials, use them
+        if creds and creds.valid:
+            logger.info("Using existing valid credentials")
+            return creds
+        
+        # If credentials are expired, try to refresh
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                logger.info("Refreshing expired credentials")
+                creds.refresh(Request())
+                
+                # Save refreshed credentials
+                with open(token_path, 'wb') as token:
+                    pickle.dump(creds, token)
+                logger.info("Credentials refreshed and saved")
+                return creds
+            except Exception as e:
+                logger.warning(f"Token refresh failed: {e}")
+                creds = None
+        
+        # Run OAuth flow for new credentials
+        try:
+            logger.info("Starting OAuth flow...")
+            flow = InstalledAppFlow.from_client_secrets_file(credentials_path, self.SCOPES)
+            
+            # Try local server first, fallback to console
+            try:
+                creds = flow.run_local_server(port=0, open_browser=True)
+                logger.info("OAuth completed via local server")
+            except Exception as e:
+                logger.warning(f"Local server failed: {e}")
+                logger.info("Please complete OAuth manually:")
+                creds = flow.run_console()
+                logger.info("OAuth completed via console")
+            
+            # Save the credentials
+            with open(token_path, 'wb') as token:
+                pickle.dump(creds, token)
+            logger.info(f"Credentials saved to {token_path}")
+            
+            # Also log the refresh token for production use
+            if creds.refresh_token:
+                logger.info("=" * 50)
+                logger.info("IMPORTANT: Save this refresh token for production:")
+                logger.info(f"GMAIL_REFRESH_TOKEN={creds.refresh_token}")
+                logger.info("=" * 50)
+            
+            return creds
+            
+        except Exception as e:
+            logger.error(f"OAuth flow failed: {e}")
+            return None
         
     def authenticate(self) -> bool:
-        """Authenticate and build Gmail service with environment variable handling for production"""
+        """Authenticate and build Gmail service"""
         with self._auth_lock:
             try:
                 creds = None
                 
+                # Try environment variables first (for production)
+                logger.info("Attempting authentication...")
+                
                 # For production (Render), use environment variables
                 if os.getenv('GMAIL_CREDENTIALS_JSON') and os.getenv('GMAIL_REFRESH_TOKEN'):
-                    logger.info("Using environment variables for authentication (production mode)")
+                    logger.info("Trying environment variable authentication")
                     creds = self.create_credentials_from_env()
                 
-                # For local development, use files
-                else:
-                    logger.info("Using file-based authentication (development mode)")
-                    credentials_path = os.getenv('GMAIL_CREDENTIALS_PATH', 'credentials.json')
-                    token_path = os.getenv('GMAIL_TOKEN_PATH', 'token.json')
-                    
-                    # Load existing token
-                    if os.path.exists(token_path):
-                        try:
-                            with open(token_path, 'rb') as token:
-                                creds = pickle.load(token)
-                            logger.info("Loaded existing credentials from token file")
-                        except Exception as e:
-                            logger.warning(f"Could not load existing token: {e}")
-                            if os.path.exists(token_path):
-                                try:
-                                    os.remove(token_path)
-                                    logger.info("Removed corrupted token file")
-                                except:
-                                    pass
-                    
-                    # Check if credentials are valid
-                    if creds and creds.valid:
-                        logger.info("Using valid existing credentials")
-                    elif creds and creds.expired and creds.refresh_token:
-                        try:
-                            logger.info("Refreshing expired credentials")
-                            creds.refresh(Request())
-                            logger.info("Successfully refreshed credentials")
-                            
-                            # Save refreshed credentials
-                            with open(token_path, 'wb') as token:
-                                pickle.dump(creds, token)
-                                
-                        except Exception as e:
-                            logger.warning(f"Token refresh failed: {e}")
-                            creds = None
-                    
-                    # If no valid credentials, run OAuth flow
-                    if not creds:
-                        if not os.path.exists(credentials_path):
-                            logger.error(f"Credentials file not found: {credentials_path}")
-                            logger.error("For production deployment, set GMAIL_CREDENTIALS_JSON and GMAIL_REFRESH_TOKEN environment variables")
-                            return False
-                        
-                        logger.info("Running OAuth flow for new credentials")
-                        flow = InstalledAppFlow.from_client_secrets_file(
-                            credentials_path, self.SCOPES)
-                        
-                        # Try to run local server, fallback to console if needed
-                        try:
-                            creds = flow.run_local_server(port=0, open_browser=True)
-                        except Exception as e:
-                            logger.warning(f"Could not run local server: {e}")
-                            logger.info("Please complete authentication manually:")
-                            creds = flow.run_console()
-                        
-                        logger.info("OAuth flow completed successfully")
-                        
-                        # Save the credentials for future use
-                        try:
-                            with open(token_path, 'wb') as token:
-                                pickle.dump(creds, token)
-                            logger.info("Saved credentials to token file")
-                        except Exception as e:
-                            logger.error(f"Could not save credentials: {e}")
+                # For local development, use files and OAuth flow
+                if not creds:
+                    logger.info("Trying local file authentication")
+                    creds = self.setup_local_oauth()
                 
                 if not creds:
                     logger.error("Failed to obtain valid credentials")
@@ -971,7 +996,7 @@ class GmailAPIProcessor:
         
         # Return empty if too short or only special characters
         if len(value) < 1 or re.match(r'^[^\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]+$'
-                , value):
+                    , value):
             return ""
         
         return value
@@ -1229,12 +1254,24 @@ def main():
                        help='Run once instead of continuous mode')
     parser.add_argument('--stats', '-s', action='store_true',
                        help='Show processing statistics and exit')
+    parser.add_argument('--setup-oauth', action='store_true',
+                       help='Set up OAuth credentials (run this first)')
     
     args = parser.parse_args()
     
     # Initialize processor
     try:
         processor = GmailAPIProcessor(webhook_url=args.webhook)
+        
+        # Set up OAuth if requested
+        if args.setup_oauth:
+            logger.info("Setting up OAuth credentials...")
+            if processor.authenticate():
+                logger.info("OAuth setup completed successfully!")
+                logger.info("You can now run the processor normally.")
+            else:
+                logger.error("OAuth setup failed!")
+            return
         
         # Show stats if requested
         if args.stats:

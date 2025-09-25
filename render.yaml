@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: email-processor
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: AUTO_START
+        value: true
+      - key: CHECK_INTERVAL_SECONDS
+        value: 30
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 10000
+      - key: MAX_EMAILS_PER_CHECK
+        value: 50
+      - key: ARCHIVE_PROCESSED_EMAILS
+        value: true
+      - key: LOG_LEVEL
+        value: INFO
+      - key: DEBUG
+        value: false
