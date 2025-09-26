@@ -27,7 +27,7 @@ from flask import Flask, render_template_string, jsonify, request
 from flask_cors import CORS
 
 # Import the updated email processor
-from email_processor import GmailAPIProcessor
+from email_processor import EnhancedGmailProcessor 
 
 # Configure logging for Render (no file logging)
 log_level = getattr(logging, os.getenv('LOG_LEVEL', 'INFO').upper())
@@ -100,7 +100,7 @@ class EmailProcessorService:
                 logger.warning("No webhook URL configured - webhooks will be skipped")
             
             # Initialize processor
-            self.processor = GmailAPIProcessor(webhook_url=self.config['webhook_url'])
+            self.processor = EnhancedGmailProcessor(webhook_url=self.config['webhook_url'])
             
             # Attempt authentication
             auth_success = self.processor.authenticate()
@@ -372,7 +372,7 @@ class EmailProcessorService:
         """Set up OAuth credentials manually"""
         try:
             if not self.processor:
-                self.processor = GmailAPIProcessor(webhook_url=self.config['webhook_url'])
+                self.processor = EnhancedGmailProcessor(webhook_url=self.config['webhook_url'])
             
             self.log_message("Starting OAuth setup...")
             
