@@ -430,20 +430,17 @@ class SmartFieldExtractor:
         return is_valid, cleaned
     
     def clean_generic_value(self, value: str) -> str:
-        """Clean generic field values with enhanced cleaning for unwanted characters"""
+        """Clean generic field values"""
         if not value:
             return ""
         
-        # Remove unwanted patterns including the 】 character
+        # Remove unwanted patterns
         unwanted_patterns = [
             r'^\s*[：:]\s*',  # Leading colon
             r'\s*[：:]\s*$',  # Trailing colon
             r'\s*様\s*$',     # Honorific suffix
             r'\s*さん\s*$',
-            r'\s*殿\s*$',
-            r'^[】\s]*',      # Leading 】 and whitespace
-            r'[【\s]*$',      # Trailing 【 and whitespace
-            r'[】【]',        # Any remaining brackets
+            r'\s*殿\s*$'
         ]
         
         cleaned = value.strip()
@@ -713,68 +710,6 @@ class EmailDatabase:
         except Exception as e:
             logger.error(f"Error getting stats: {e}")
             return {'total_processed': 0, 'successful_webhooks': 0, 'failed_webhooks': 0}
-    
-    def update_daily_stats(self, processed: int, successful: int, failed: int):
-        """Update daily statistics"""
-        try:
-            with self._connection_lock:
-                conn = self.get_connection()
-                cursor = conn.cursor()
-                
-                today = datetime.now().strftime('%Y-%m-%d')
-                cursor.execute('''
-                    INSERT OR REPLACE INTO processing_stats
-                    (date, emails_processed, webhooks_successful, webhooks_failed)
-                    VALUES (?, ?, ?, ?)
-                ''', (today, processed, successful, failed))
-                
-                conn.commit()
-        except Exception as e:
-            logger.error(f"Error updating daily stats: {e}")
-    
-    def get_recent_processed_emails(self, limit: int = 10) -> List[Dict]:
-        """Get recently processed emails"""
-        try:
-            with self._connection_lock:
-                conn = self.get_connection()
-                cursor = conn.cursor()
-                
-                cursor.execute('''
-                    SELECT subject, sender, processed_date, extraction_confidence
-                    FROM processed_emails
-                    ORDER BY processed_date DESC
-                    LIMIT ?
-                ''', (limit,))
-                
-                return [
-                    {
-                        'subject': row[0] or 'No Subject',
-                        'sender': row[1] or 'Unknown',
-                        'processed_date': row[2],
-                        'confidence': row[3] or 0.0
-                    }
-                    for row in cursor.fetchall()
-                ]
-        except Exception as e:
-            logger.error(f"Error getting recent emails: {e}")
-            return []
-    
-    def clear_all_data(self):
-        """Clear all processed email data"""
-        try:
-            with self._connection_lock:
-                conn = self.get_connection()
-                cursor = conn.cursor()
-                
-                cursor.execute("DELETE FROM extracted_fields")
-                cursor.execute("DELETE FROM processing_stats")
-                cursor.execute("DELETE FROM processed_emails")
-                
-                conn.commit()
-                logger.info("All processed email data cleared")
-        except Exception as e:
-            logger.error(f"Error clearing data: {e}")
-            raise
     
     def cleanup_old_connections(self):
         """Clean up old database connections"""
@@ -1350,24 +1285,6 @@ class EnhancedGmailProcessor:
             logger.error(f"Error fetching email {email_id}: {e}")
             return None
     
-    def extract_sender_email(self, sender_string: str) -> str:
-        """Extract just the email address from sender string"""
-        if not sender_string:
-            return ""
-        
-        # Look for email in angle brackets first: "Name" <email@domain.com>
-        email_match = re.search(r'<([^>]+@[^>]+)>', sender_string)
-        if email_match:
-            return email_match.group(1).strip()
-        
-        # If no angle brackets, look for standalone email pattern
-        email_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', sender_string)
-        if email_match:
-            return email_match.group(1).strip()
-        
-        # Fallback: return original if no email found
-        return sender_string
-    
     def extract_email_data(self, message: Dict) -> Optional[Dict]:
         """Extract structured data from Gmail API message with better error handling"""
         try:
@@ -1390,7 +1307,7 @@ class EnhancedGmailProcessor:
                 value = header['value']
                 
                 if name == 'from':
-                    email_data['sender'] = self.extract_sender_email(value)  # Now extracts only email address
+                    email_data['sender'] = value
                 elif name == 'to':
                     email_data['recipient'] = value
                 elif name == 'subject':
